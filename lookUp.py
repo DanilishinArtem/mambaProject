@@ -1,11 +1,12 @@
-from torch.utils.data import Dataset, DataLoader
-import pandas as pd
+from torch.utils.data import DataLoader
 import torch
-from dataset.tokenChoosingDataset import TopKTokenSelectionDataset
-from trainer.trainTokenChoosing import train_and_eval_topk
+import pandas as pd
+from dataset.lookUpDataset import LookupDataset
+from models.LSTM import LSTM
 from models.mambaPlusPlus import MambaPlusPlus_regular
 from models.LSTM import LSTM
 from models.transformer import Transformer
+from trainer.trainLookUp import train_and_eval_lookup
 
 def run_experiment(epochs):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -13,17 +14,15 @@ def run_experiment(epochs):
     embed_dim = 32
     hidden_dim = 64
     num_heads = 4
-    seq_len = 32
+    seq_len = 21  # 10 пар + 1 запрос
     batch_size = 64
     num_samples = 10000
-    top_k = 3
     epochs = 5
 
-    # Инициализация данных и модели
-    train_ds = TopKTokenSelectionDataset(seq_len=seq_len, vocab_size=vocab_size, num_samples=num_samples, top_k=top_k)
+    train_ds = LookupDataset(seq_len=seq_len, vocab_size=vocab_size, num_samples=num_samples)
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
 
-    test_seq_lens = [16, 32, 64]
+    test_seq_lens = [11, 21, 41]
 
     models = {
         "LSTM": LSTM(vocab_size, embed_dim, hidden_dim),
@@ -34,14 +33,13 @@ def run_experiment(epochs):
     all_results = {}
     for name, model in models.items():
         print(f"\n=== Training {name} ===")
-        results = train_and_eval_topk(
+        results = train_and_eval_lookup(
             model=model,
-            name=name,
+            name="mamba++_lookup",
             train_loader=train_loader,
             test_seq_lens=test_seq_lens,
             device=device,
-            epochs=epochs,
-            top_k=top_k
+            epochs=epochs
         )
         all_results[name] = results
 

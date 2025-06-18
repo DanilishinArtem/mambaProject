@@ -1,6 +1,6 @@
 import torch.nn as nn
 
-class LSTMCopy(nn.Module):
+class LSTM(nn.Module):
     def __init__(self, vocab_size, embed_dim, hidden_dim):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, embed_dim, padding_idx=0)

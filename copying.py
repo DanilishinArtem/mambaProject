@@ -1,11 +1,11 @@
 from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 import torch
-from dataset.copyDataset import CopyDataset, NoisyCopyDataset
-from models.LSTMCopy import LSTMCopy
-from models.transformerCopy import TransformerCopy
-from models.mambaPlusPlus import MambaPlusPlus
-from trainer.train_eval import train_and_eval
+from dataset.copyingDataset import CopyDataset, NoisyCopyDataset
+from models.LSTM import LSTM
+from models.transformer import Transformer
+from models.mambaPlusPlus import MambaPlusPlus_regular
+from trainer.trainCopying import train_and_eval
 
 def run_experiment(epochs):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -21,9 +21,9 @@ def run_experiment(epochs):
     test_seq_lens = [50, 100, 200, 300, 500, 1000]
 
     models = {
-        "LSTM": LSTMCopy(vocab_size, embed_dim, hidden_dim),
-        "Transformer": TransformerCopy(vocab_size, embed_dim, nhead=2, num_layers=8),
-        "Mamba++": MambaPlusPlus(vocab_size, embed_dim, hidden_dim, num_heads=2)
+        "LSTM": LSTM(vocab_size, embed_dim, hidden_dim),
+        "Transformer": Transformer(vocab_size, embed_dim, nhead=2, num_layers=8),
+        "Mamba++": MambaPlusPlus_regular(vocab_size, embed_dim, hidden_dim, num_heads=2)
     }
 
     all_results = {}
