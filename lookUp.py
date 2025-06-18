@@ -35,7 +35,7 @@ def run_experiment(epochs):
         print(f"\n=== Training {name} ===")
         results = train_and_eval_lookup(
             model=model,
-            name="mamba++_lookup",
+            name=name,
             train_loader=train_loader,
             test_seq_lens=test_seq_lens,
             device=device,

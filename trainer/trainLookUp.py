@@ -30,7 +30,7 @@ def train_and_eval_lookup(model, name, train_loader, test_seq_lens, device, epoc
             optimizer.step()
             total_loss += loss.item()
             writer.add_scalar(f"Loss/{name}", total_loss / global_step, global_step)
-        print(f"[{name}] Epoch {epoch+1}/{epochs}, Loss = {total_loss/len(train_loader):.4f}")
+        print(f"Epoch {epoch+1}/{epochs}, Loss = {total_loss/len(train_loader):.4f}")
     print("Training time:", round(time.time() - start_of_training, 2), "sec")
 
     # Оценка

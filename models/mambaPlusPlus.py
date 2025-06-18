@@ -113,21 +113,64 @@ class MambaPlusPlus_optimized(nn.Module):
         return logits
     
 
+# ------------------------------------------------------------
+
+class MambaPlusPlus_layer(nn.Module):
+    def __init__(self, embed_dim, hidden_dim, num_heads):
+        super().__init__()
+        assert hidden_dim % num_heads == 0, "hidden_dim must be divisible by num_heads"
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+        # Parameter generators for each head
+        self.W_a = nn.ModuleList([nn.Linear(embed_dim, self.head_dim) for _ in range(num_heads)])
+        self.W_b = nn.ModuleList([nn.Linear(embed_dim, self.head_dim) for _ in range(num_heads)])
+        self.W_out = nn.ModuleList([nn.Linear(embed_dim, self.head_dim) for _ in range(num_heads)])
+        self.C   = nn.ModuleList([nn.Linear(self.head_dim, self.head_dim) for _ in range(num_heads)])
+        # Projection and FFN
+        self.proj = nn.Linear(hidden_dim, hidden_dim)
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.ffn1 = nn.Linear(hidden_dim, hidden_dim * 4)
+        self.ffn2 = nn.Linear(hidden_dim * 4, hidden_dim)
+        self.act = nn.GELU()
+
+    def forward(self, emb):
+        B, L, _ = emb.shape
+        h = [torch.zeros(B, self.head_dim, device=emb.device) for _ in range(self.num_heads)]
+        head_outputs = []
+        # SSM update per time step
+        for t in range(L):
+            head_outs_t = []
+            for i in range(self.num_heads):
+                a_t = torch.tanh(self.W_a[i](emb[:, t]))
+                b_t = self.W_b[i](emb[:, t])
+                h[i] = a_t * h[i] + b_t
+                head_out = self.C[i](h[i]) * self.W_out[i](emb[:, t])
+                head_outs_t.append(head_out)
+            # Concatenate heads
+            concat = torch.cat(head_outs_t, dim=-1)
+            head_outputs.append(concat.unsqueeze(1))
+        z = torch.cat(head_outputs, dim=1)
+        u = z + self.norm(z)
+        ffn_out = self.act(self.ffn1(u))
+        o = self.ffn2(ffn_out)
+        h_out = u + o
+        return self.proj(h_out)
+
+
 class MambaPlusPlusML(nn.Module):
-    def __init__(self, vocab_size, embed_dim, num_heads, num_layers):
+    def __init__(self, vocab_size, embed_dim, hidden_dim, num_heads, num_layers):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
         self.layers = nn.ModuleList(
-            [MambaPlusPlus_regular(embed_dim, embed_dim, num_heads) for _ in range(num_layers)]
+            [MambaPlusPlus_layer(embed_dim, hidden_dim, num_heads) for _ in range(num_layers)]
         )
         self.norm = nn.LayerNorm(embed_dim)
         self.output_fc = nn.Linear(embed_dim, vocab_size)
         
     def forward(self, x):
-        # x: (B, L)
-        x = self.embed(x)  # (B, L, embed_dim)
+        x = self.embed(x)
         for layer in self.layers:
             x = layer(x)
         x = self.norm(x)
-        logits = self.output_fc(x)  # (B, L, vocab_size)
+        logits = self.output_fc(x)
         return logits
