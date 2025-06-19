@@ -12,6 +12,7 @@ def run_experiment(epochs):
     vocab_size = 100
     embed_dim = 8
     hidden_dim = 16
+    heads = 2
 
     # Датасет длины 50
     train_ds = CopyDataset(seq_len=50, vocab_size=vocab_size, num_samples=2000)
@@ -21,9 +22,9 @@ def run_experiment(epochs):
     test_seq_lens = [50, 100, 200, 300, 500, 1000]
 
     models = {
-        "LSTM": LSTM(vocab_size, embed_dim, hidden_dim),
-        "Transformer": Transformer(vocab_size, embed_dim, nhead=2, num_layers=8),
-        "Mamba++": MambaPlusPlus_regular(vocab_size, embed_dim, hidden_dim, num_heads=2)
+        # "LSTM": LSTM(vocab_size, embed_dim, hidden_dim),
+        # "Transformer": Transformer(vocab_size, embed_dim, nhead=heads, num_layers=1),
+        "Mamba++": MambaPlusPlus_regular(vocab_size, embed_dim, embed_dim * 4, num_heads=heads)
     }
 
     all_results = {}

@@ -19,8 +19,8 @@ def run_experiment(epochs=3):
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
 
     models = {
-        "Transformer": Transformer(vocab_size=vocab_size, embed_dim=1024, nhead=2, num_layers=2),
-        "Mamba++": MambaPlusPlusML(vocab_size=vocab_size, embed_dim=1024, hidden_dim=1024, num_heads=2, num_layers=2)
+        "Transformer": Transformer(vocab_size=vocab_size, embed_dim=1024, nhead=4, num_layers=1)#,
+        # "Mamba++": MambaPlusPlusML(vocab_size=vocab_size, embed_dim=1024, hidden_dim=1024, num_heads=4, num_layers=1)
     }
 
     all_losses = {}
