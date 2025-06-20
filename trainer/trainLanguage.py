@@ -11,14 +11,14 @@ def train_and_eval_language(model, name, train_loader, device, epochs=3, eval_st
     model.train()
     optimizer = optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.1)
     criterion = nn.CrossEntropyLoss(ignore_index=0)
-    global_step = 0
     start_time = time.time()
 
-    for epoch in range(epochs):
-        total_loss = 0.0
-        total_correct = 0
-        total_tokens = 0
+    global_step = 0
+    total_loss = 0.0
+    total_correct = 0
+    total_tokens = 0
 
+    for epoch in range(epochs):
         for batch_idx, (x, y) in enumerate(train_loader):
             x, y = x.to(device), y.to(device)
             optimizer.zero_grad()

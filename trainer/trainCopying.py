@@ -6,15 +6,15 @@ from torch.utils.tensorboard import SummaryWriter
 writer = SummaryWriter(log_dir="./tensorboard/copying")
 
 def train_and_eval(model, name, train_loader, test_seq_lens, device, epochs=5):
-    global_step = 0
     model.to(device)
     optimizer = optim.Adam(model.parameters(), lr=1e-3)
     criterion = nn.CrossEntropyLoss(ignore_index=0)
     # Тренировка
     model.train()
     start_of_training = time.time()
+    total_loss = 0
+    global_step = 0
     for epoch in range(epochs):
-        total_loss = 0
         for x, y in train_loader:
             global_step += 1
             x, y = x.to(device), y.to(device)

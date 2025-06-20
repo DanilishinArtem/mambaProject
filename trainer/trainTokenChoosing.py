@@ -7,7 +7,6 @@ from torch.utils.tensorboard import SummaryWriter
 writer = SummaryWriter(log_dir="./tensorboard/token_selection")
 
 def train_and_eval_topk(model, name, train_loader, test_seq_lens, device, epochs=5, top_k=1):
-    global_step = 0
     model.to(device)
     optimizer = optim.Adam(model.parameters(), lr=1e-3)
     criterion = nn.BCEWithLogitsLoss()
@@ -15,8 +14,9 @@ def train_and_eval_topk(model, name, train_loader, test_seq_lens, device, epochs
     # Тренировка
     model.train()
     start_of_training = time.time()
+    global_step = 0
+    total_loss = 0
     for epoch in range(epochs):
-        total_loss = 0
         for x, y in train_loader:
             global_step += 1
             x, y = x.to(device), y.to(device).float()
