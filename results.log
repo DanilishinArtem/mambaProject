@@ -1,0 +1,24 @@
+/home/adanilishin/miniconda3/lib/python3.12/site-packages/torch/nn/modules/transformer.py:382: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.self_attn.batch_first was not True(use batch_first for better inference performance)
+  warnings.warn(
+Using the latest cached version of the dataset since cimec/lambada couldn't be found on the Hugging Face Hub
+Found the latest cached dataset configuration 'plain_text' at /home/adanilishin/.cache/huggingface/datasets/cimec___lambada/plain_text/0.0.0/5953bd97664b64b95754f299b2309ecfbfbe81b9 (last modified on Mon Jun 23 01:33:52 2025).
+🔧 Training Mamba++...
+Training Epoch 1: 100%|██████████| 267/267 [02:16<00:00,  1.95it/s]
+Epoch 1 - Avg Loss: 3.5320
+Training Epoch 2: 100%|██████████| 267/267 [02:14<00:00,  1.99it/s]
+Epoch 2 - Avg Loss: 1.3964
+Training Epoch 3: 100%|██████████| 267/267 [02:14<00:00,  1.98it/s]
+Epoch 3 - Avg Loss: 0.8543
+📊 Evaluating Mamba++...
+Evaluating: 100%|██████████| 67/67 [00:06<00:00, 10.01it/s]
+{'accuracy': 0.9549718574108818}
+🔧 Training Transformer...
+Training Epoch 1: 100%|██████████| 267/267 [00:11<00:00, 23.39it/s]
+Epoch 1 - Avg Loss: 4.2213
+Training Epoch 2: 100%|██████████| 267/267 [00:11<00:00, 23.73it/s]
+Epoch 2 - Avg Loss: 1.6112
+Training Epoch 3: 100%|██████████| 267/267 [00:11<00:00, 24.03it/s]
+Epoch 3 - Avg Loss: 0.9810
+📊 Evaluating Transformer...
+Evaluating: 100%|██████████| 67/67 [00:01<00:00, 54.38it/s]
+{'accuracy': 0.949343339587242}
