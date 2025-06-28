@@ -1,5 +1,6 @@
-import torch.nn as nn
 import torch
+import torch.nn as nn
+from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
 
 class MambaPlusPlus_layer(nn.Module):
     def __init__(self, dim, num_heads, dropout=0.1):
@@ -8,32 +9,27 @@ class MambaPlusPlus_layer(nn.Module):
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
-        
-        # Input projections
-        self.W_a = nn.Linear(dim, dim)
-        self.W_b = nn.Linear(dim, dim)
-        self.W_out = nn.Linear(dim, dim)
+
+        self.W_a = nn.Linear(dim, dim)  # Для delta
+        self.W_b = nn.Linear(dim, dim)  # Для B
+        self.W_out = nn.Linear(dim, dim)  # После selective_scan
         self.C = nn.Linear(dim, dim)
-        
-        # Gating and residual
+
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
         self.dropout = nn.Dropout(dropout)
-        
-        # FFN
+
         self.ffn = nn.Sequential(
             nn.Linear(dim, dim * 4),
             nn.GELU(),
             nn.Linear(dim * 4, dim),
             nn.Dropout(dropout)
         )
-        
-        # Head weights
+
         self.head_weights = nn.Parameter(torch.ones(num_heads))
         self._init_weights()
 
     def _init_weights(self):
-        # Xavier initialization
         for name, param in self.named_parameters():
             if "weight" in name and "head_weights" not in name:
                 if len(param.shape) >= 2:
@@ -43,50 +39,41 @@ class MambaPlusPlus_layer(nn.Module):
         nn.init.normal_(self.head_weights, mean=1.0, std=0.02)
 
     def forward(self, emb, padding_mask=None):
-        B, L, _ = emb.shape
-        H, D = self.num_heads, self.head_dim
-        
-        # Projections
-        a_proj = torch.tanh(self.W_a(emb)).view(B, L, H, D)
-        b_proj = self.W_b(emb).view(B, L, H, D)
-        w_proj = self.W_out(emb).view(B, L, H, D)
-        
-        # RNN state
-        h = torch.zeros(B, H, D, device=emb.device)
-        outputs = []
-        
-        # Process sequence
-        for t in range(L):
-            # Get mask for active sequences
-            if padding_mask is not None:
-                active = ~padding_mask[:, t]  # (B,)
-            else:
-                active = torch.ones(B, dtype=torch.bool, device=emb.device)
-            
-            a_t = a_proj[:, t]  # (B, H, D)
-            b_t = b_proj[:, t]  # (B, H, D)
-            w_t = w_proj[:, t]  # (B, H, D)
-            
-            # Update state (only for active sequences)
-            h_next = a_t * h + b_t
-            h = torch.where(active.view(B, 1, 1), h_next, h)
-            
-            # Output projection
-            c_out = self.C(h.reshape(B, -1)).view(B, H, D)
-            out = self.head_weights.view(1, H, 1) * (c_out + w_t)
-            outputs.append(out.reshape(B, 1, -1))
-        
-        z = torch.cat(outputs, dim=1)  # (B, L, dim)
-        
-        # Residual connection + normalization
-        z = self.norm1(emb + self.dropout(z))
-        
-        # FFN with residual
+        B, L, D = emb.shape
+
+        # Проекции
+        delta = torch.tanh(self.W_a(emb))               # (B, L, D)
+        B_proj = self.W_b(emb)                          # (B, L, D)
+
+        # Selective Scan
+        A = torch.ones_like(delta[:, :, :1])            # (B, L, 1)
+        C_proj = torch.zeros_like(B_proj)               # (B, L, D)
+        D_proj = torch.ones_like(B_proj[:, :, 0])       # (B, L)
+
+        scan_out = selective_scan_fn(
+            x=None,
+            delta=delta,
+            A=A,
+            B=B_proj,
+            C=C_proj,
+            D=D_proj,
+            z=None,
+            delta_bias=None,
+            delta_softplus=False,
+        )  # (B, D, L)
+
+        # Переводим обратно в (B, L, D)
+        scan_out = scan_out.permute(0, 2, 1).contiguous()
+        scan_out = self.W_out(scan_out)
+
+        # Residual + Norm
+        z = self.norm1(emb + self.dropout(scan_out))
+
+        # FFN + Residual + Norm
         ffn_out = self.ffn(z)
         out = self.norm2(z + ffn_out)
-        
         return out
-
+    
 
 class MambaPlusPlusML(nn.Module):
     def __init__(self, vocab_size, dim, num_heads, num_layers, max_seq_len, dropout=0.1):
