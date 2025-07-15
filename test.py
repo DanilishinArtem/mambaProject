@@ -1,21 +1,25 @@
-import torch
-import mamba_cuda
+from dataset.Babilong import BABILongDataset
+from dataset.Wikitext import WikiTextDataset
 
-B, L, H, D = 2, 8, 4, 16
-dim = H * D
+def test_dataset(tag, max_items):
+    counter = 0
+    if tag == "babilong":
+        data = BABILongDataset("./dataset/babilong/8k")
+    elif tag == "wikitext":
+        data = WikiTextDataset("./dataset/wikitext")
+    print("[INFO] End of creating of {} dataset ...".format(tag))
+    dataLoader = data.get_data_loader()
+    print("[INFO] End of getting data loader ...")
+    for item in dataLoader:
+        counter += 1
+        print("[INFO] input_ids: {}".format(item['input_ids'].shape))
+        print("[INFO] attention_mask: {}".format(item['attention_mask'].shape))
+        print("[INFO] labels: {}".format(item['labels'].shape))
+        if counter == max_items:
+            break
+    print('[INFO] Success ...')
 
-a_proj = torch.rand(B, L, H, D, device='cuda', requires_grad=True)
-b_proj = torch.rand(B, L, H, D, device='cuda', requires_grad=True)
-w_proj = torch.rand(B, L, H, D, device='cuda')
 
-C_weight = torch.randn(dim, dim, device='cuda')
-C_bias = torch.randn(dim, device='cuda')
-head_weights = torch.randn(H, device='cuda')
-
-out = mamba_cuda.full_forward(a_proj, b_proj, w_proj, C_weight, C_bias, head_weights)
-
-grad_out = torch.ones_like(out)
-
-grad_a, grad_b = mamba_cuda.full_backward(grad_out, a_proj, b_proj, B, L, H, D)
-
-print(grad_a.shape, grad_b.shape)
+if __name__ == "__main__":
+    # test_dataset("babilong", 100)
+    test_dataset("wikitext", 100)
