@@ -96,7 +96,7 @@ class MambaPlusPlusML(nn.Module):
             nn.init.normal_(module.weight, mean=0, std=0.02)
 
     def forward(self, input_ids, labels=None):
-        emb = self.embed(input_ids) + self.pos_embed[:, :input_ids.size(1), :]
+        emb = self.embed(input_ids)
         x = self.dropout(emb)
 
         for layer in self.layers:
