@@ -9,26 +9,23 @@ class MambaPlusPlus_layer(nn.Module):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
-        self.head_dim = dim // num_heads
 
         self.mambas = nn.ModuleList([
             Mamba(
-                d_model=self.head_dim,
-                d_state=int(16*num_heads*num_heads),
+                d_model=dim,
+                d_state=16 + i,
                 d_conv=4,
                 expand=2,
-            ) for i in range(num_heads)
+            )
+            for i in range(num_heads)
         ])
-
+        # self.head_weights = nn.Parameter(torch.ones(num_heads))
         self.norm = RMSNorm(dim)
-        self.perceptron = nn.Linear(dim, dim)
-
-        # Optional: learned gating
-        self.head_gate = nn.Parameter(torch.ones(num_heads))
+        self.perceptron = nn.Linear(num_heads * dim, dim)
 
     def forward(self, hidden_states, residual=None, padding_mask=None):
         B, L, D = hidden_states.shape
-        H, D_h = self.num_heads, self.head_dim
+        H = self.num_heads
 
         hidden_states, residual = layer_norm_fn(
             hidden_states,
@@ -39,18 +36,17 @@ class MambaPlusPlus_layer(nn.Module):
             is_rms_norm=True
         )
 
-        # (B, L, H, D_head) → (B, H, L, D_head)
-        x_heads = hidden_states.view(B, L, H, D_h).transpose(1, 2)
-        outputs = []
-
-        soft_gates = torch.softmax(self.head_gate, dim=0)  # optional
-
+        head_outputs = []
         for h in range(H):
-            y = self.mambas[h](x_heads[:, h, :, :])  # (B, L, D_head)
-            y = y * soft_gates[h]
-            outputs.append(y)
+            stride = h + 1  # 1 для первой головы, 2 — для второй, и т.д.
+            x_subsampled = hidden_states[:, ::stride, :]  # (B, L_h, D)
+            y = self.mambas[h](x_subsampled)  # (B, L_h, D)
+            # Вставим обратно в тензор размера (B, L, D)
+            expanded = torch.zeros(B, L, D, device=hidden_states.device, dtype=hidden_states.dtype)
+            expanded[:, ::stride, :] = y
+            head_outputs.append(expanded)        
 
-        stacked = torch.stack(outputs, dim=1).transpose(1, 2).reshape(B, L, D)
+        stacked = torch.stack(head_outputs, dim=0).permute(1, 2, 0, 3).reshape(B, L, H * D)
         hidden_states = self.perceptron(stacked)
         return hidden_states, residual
 

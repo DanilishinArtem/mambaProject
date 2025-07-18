@@ -9,6 +9,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from datasets import load_dataset, DatasetDict
 
 import numpy as np
+import random
 import matplotlib.pyplot as plt
 
 import torch
@@ -34,6 +35,24 @@ from test_utils import evaluation
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
+def fix_seeds(seed: int = 42):
+    # Python
+    random.seed(seed)
+
+    # NumPy
+    np.random.seed(seed)
+
+    # PyTorch
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # if using multi-GPU
+
+    # Для воспроизводимости на CUDA (но может замедлить обучение)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    # PyTorch 2.0 и выше — полная детерминированность (если нужно)
+    torch.use_deterministic_algorithms(True, warn_only=True)
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -92,7 +111,7 @@ def parse_args():
 
 
 
-
+fix_seeds()
 args = parse_args()
 
 print(args)
