@@ -4,3 +4,4 @@ __pycache__
 /checkpoints/
 /tensorboard/
 /mamba/
+/transformers_ssm_copy/tensorboard/

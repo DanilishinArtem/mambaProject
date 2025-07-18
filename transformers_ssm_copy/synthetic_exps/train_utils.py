@@ -35,9 +35,9 @@ def custom_get_scheduler(optimizer,num_training_steps):
     )
     return lr_scheduler
 
-
-def train(args,model, train_dataset, TO_TOKEN):
-    
+from torch.utils.tensorboard import SummaryWriter
+def train(args,model, train_dataset, tokenizer, TO_TOKEN):
+    writer = SummaryWriter(log_dir="./tensorboard/"+f"model_{args.model}_layer_{args.layers}_hidden_{args.hidden_size}_heads_{args.heads}_train_{args.train_task}_lr_{args.lr}_epochs_{args.epochs}_steps_{args.steps}/")
     optimizer = get_optimizer(model,args)
     
     ## Set model to GPU
@@ -60,7 +60,7 @@ def train(args,model, train_dataset, TO_TOKEN):
 
 
     gradient_accumulation_steps = 1
-
+    counter = 0
     model.train()
     completed_steps = 0
     num_train_epochs = 1
@@ -87,7 +87,9 @@ def train(args,model, train_dataset, TO_TOKEN):
 
             if args.model=="mamba":
                 logits = logits[0]
-
+            
+            if args.model=="mambapp":
+                logits = logits['logits']
 
             loss = ce_loss(y, logits, mask, TO_TOKEN)
             if (step+1) % num_log_steps == 0:
@@ -105,8 +107,11 @@ def train(args,model, train_dataset, TO_TOKEN):
                 completed_steps += 1
             if step > num_training_steps:
                 break
+
             # Update tqdm description with the current loss
             progress_bar.set_postfix({'Loss': loss.item()})
+            writer.add_scalar("Train/Loss", loss.item(), step)
+
 
 
 

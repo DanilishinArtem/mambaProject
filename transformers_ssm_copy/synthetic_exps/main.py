@@ -142,7 +142,7 @@ print("^"*100)
 
 
 ## train the model
-train(args,model,train_dataset,TO_TOKEN)
+train(args,model,train_dataset,tokenizer,TO_TOKEN)
 
 
 
