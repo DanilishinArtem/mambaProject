@@ -16,6 +16,21 @@ def print_model_parameters(model, name):
 
 
 def create_mamba_model():
+    # from mamba_ssm.models.config_mamba import MambaConfig
+    # from models.mamba import MambaLMHeadModel
+    # vocab_size = len(Config.tokenizer)
+    # print("[INFO] vocab_size = {}".format(vocab_size))
+    # config = MambaConfig(
+    #     d_model=Config.embed_dim,
+    #     n_layer=Config.num_layers,
+    #     ssm_cfg={"d_state": 16},
+    #     vocab_size=vocab_size,
+    #     # tie_embeddings=False,
+    #     # residual_in_fp32=False
+    # )
+    # mamba = MambaLMHeadModel(config).to(Config.device)
+    # return mamba 
+
     vocab_size = len(Config.tokenizer)
     print("[INFO] vocab_size = {}".format(vocab_size))
     mamba = MambaPlusPlusML(
@@ -46,6 +61,7 @@ def create_transformer_model():
     transformer = GPTNeoXAlibiForCausalLM(config)
     transformer = transformer.to(Config.device)
     return transformer
+
     # vocab_size = len(Config.tokenizer)
     # print("[INFO] vocab_size = {}".format(vocab_size))
     # transformer = Transformer(

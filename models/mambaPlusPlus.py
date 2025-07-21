@@ -18,21 +18,21 @@ class MambaPlusPlus_layer(nn.Module):
                 d_state=16,
                 d_conv=4,
                 expand=2,
-                dt_min=0.001 * (1.5 ** h),
-                dt_max=0.01 * (1.5 ** h),
-                dt_scale=1.0,
+                # dt_min=0.001 * (1.5 ** h),
+                # dt_max=0.01 * (1.5 ** h),
+                # dt_scale=1.0,
             )
             for h in range(num_heads)
         ])
 
-        # # Hyena-style gating per head
-        # self.gates = nn.ModuleList([
-        #     nn.Sequential(
-        #         nn.Linear(self.head_dim, self.head_dim),
-        #         nn.SiLU()
-        #     )
-        #     for _ in range(num_heads)
-        # ])
+        # Hyena-style gating per head
+        self.gates = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(self.head_dim, self.head_dim),
+                nn.SiLU()
+            )
+            for _ in range(num_heads)
+        ])
 
         # Depth-wise conv kernel per head
         self.kernels = nn.ModuleList([
@@ -40,51 +40,38 @@ class MambaPlusPlus_layer(nn.Module):
                       padding=kernel_size // 2, groups=self.head_dim)
             for _ in range(num_heads)
         ])
-
-        self.head_weights = nn.Parameter(torch.ones(num_heads))
         self.norm = RMSNorm(dim)
 
     def forward(self, hidden_states, residual=None, padding_mask=None):
         B, L, D = hidden_states.shape
         H = self.num_heads
         Dh = self.head_dim
-
+        # Normalization
         hidden_states, residual = layer_norm_fn(
             hidden_states, self.norm.weight, self.norm.bias,
             prenorm=True, residual=residual, is_rms_norm=True
         )
 
-        # Split along feature dimension
-        hs = hidden_states.view(B, L, H, Dh).transpose(1, 2)  # (B, H, L, Dh)
+        # Split into heads: (B, L, D) → (B, H, L, Dh)
+        hs = hidden_states.view(B, L, H, Dh).transpose(1, 2)
 
         head_outputs = []
         for h in range(H):
             x_h = hs[:, h, :, :]  # (B, L, Dh)
-            stride = h + 1
-            x_sub = x_h[:, ::stride, :]  # subsampled
 
             # Core processing
-            y = self.mambas[h](x_sub)  # (B, L_h, Dh)
-            # gate = self.gates[h](x_sub)
-            # y = y * gate  # pointwise modulation
+            y = self.mambas[h](x_h)  # (B, L, Dh)
 
-            # depthwise conv
-            y = self.kernels[h](y.transpose(1, 2)).transpose(1, 2)
+            # Depth-wise conv
+            y = self.kernels[h](y.transpose(1, 2)).transpose(1, 2)  # (B, L, Dh)
+            gate = self.gates[h](x_h)
+            y = y * gate
+            head_outputs.append(y)
 
-            # expand back
-            expanded = torch.zeros(B, L, Dh, device=y.device, dtype=y.dtype)
-            expanded[:, ::stride, :] = y
-            head_outputs.append(expanded)
-
-        # stacked = torch.stack(head_outputs, dim=0)  # (H, B, L, Dh)
-        # weights = torch.softmax(self.head_weights, dim=0).view(H, 1, 1, 1)
-        # mixed = (weights * stacked).sum(dim=0)  # (B, L, Dh)
-
-        mixed = torch.cat(head_outputs, dim=-1)  # (B, L, Dh * H)
-        hidden_states = mixed
-
-        # merge heads
+        # Concatenate head outputs: (B, H, L, Dh) → (B, L, D)
+        mixed = torch.cat(head_outputs, dim=-1)
         hidden_states = mixed.view(B, L, Dh * H)
+
         return hidden_states, residual
 
 class MambaPlusPlusML(nn.Module):
