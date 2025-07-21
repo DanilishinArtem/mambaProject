@@ -5,3 +5,14 @@ __pycache__
 /tensorboard/
 /mamba/
 /transformers_ssm_copy/tensorboard/
+
+/transformer-xl/data/
+/transformer-xl/one-billion-words/
+/transformer-xl/penn/
+/transformer-xl/pennchar/
+/transformer-xl/text8/
+/transformer-xl/simple-examples.tgz
+
+/transformer-xl/pytorch/tensorboard/
+/transformer-xl/pytorch/LM-TFM-enwik8/
+/transformer-xl/pytorch/workdir/
