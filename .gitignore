@@ -16,3 +16,6 @@ __pycache__
 /transformer-xl/pytorch/tensorboard/
 /transformer-xl/pytorch/LM-TFM-enwik8/
 /transformer-xl/pytorch/workdir/
+
+/transformers_ssm_copy/custom_output_dir/
+/transformers_ssm_copy/output_dir/

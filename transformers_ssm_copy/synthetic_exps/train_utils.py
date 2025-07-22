@@ -111,6 +111,7 @@ def train(args,model, train_dataset, tokenizer, TO_TOKEN):
             # Update tqdm description with the current loss
             progress_bar.set_postfix({'Loss': loss.item()})
             writer.add_scalar("Train/Loss", loss.item(), step)
+            # writer.add_histogram("Train/Conv", model.layers[0].kernels[0].weight.data.cpu(), step)
 
 
 
