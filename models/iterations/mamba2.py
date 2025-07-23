@@ -7,7 +7,7 @@ from mamba_ssm.ops.triton.layer_norm import RMSNorm, layer_norm_fn
 class MambaPlusPlus_layer(nn.Module):
     def __init__(self, dim, num_heads=None, kernel_size=3, dropout=0.0):
         super().__init__()
-        expand = 16
+        expand = 4
         dt_hidden = 64
 
         self.dim = dim
