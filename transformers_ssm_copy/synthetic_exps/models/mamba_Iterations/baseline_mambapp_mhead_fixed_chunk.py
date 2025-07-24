@@ -10,24 +10,18 @@ class MambaPlusPlus_layer(nn.Module):
         self.dim = dim
         self.num_heads = num_heads
 
-        # Mamba-блок для всех голов одновременно
+        # Mamba-блок без циклов для всех голов
         self.mamba = Mamba(
             d_model=dim,
             d_state=16,
             d_conv=4,
             expand=2,
         )
-        # Обучаемые веса для каждой головы (будут нормироваться через softmax)
-        self.head_weights = nn.Parameter(torch.ones(num_heads))
-        # Обучаемые сдвиги: доля длины последовательности для каждой головы
-        # Инициализация равномерным распределением по головам
-        init_shifts = torch.linspace(0.0, 1.0, num_heads)
-        self.head_shift_scales = nn.Parameter(init_shifts)
-
         self.norm = RMSNorm(dim)
+        self.head_weights = nn.Parameter(torch.ones(num_heads))
 
     def forward(self, hidden_states, residual=None, padding_mask=None):
-        # Предварительная нормализация
+        # Преднорм
         hidden_states, residual = layer_norm_fn(
             hidden_states,
             self.norm.weight,
@@ -38,21 +32,16 @@ class MambaPlusPlus_layer(nn.Module):
         )
         B, L, D = hidden_states.shape
         H = self.num_heads
+        chunk = L // H
 
-        # Нормируем head_weights
+        # Вычисляем softmax-веса
         weights = torch.softmax(self.head_weights, dim=0)
-        # Вычисляем целочисленные сдвиги для roll
-        # head_shift_scales в диапазоне [0,1], умножаем на L и приводим к int
-        shifts = (self.head_shift_scales.clamp(0.0, 1.0) * L).floor().long()
 
+        # Вместо pad+truncate используем roll (шифт по Sequence)
         head_outputs = torch.zeros_like(hidden_states)
         for i in range(H):
-            shift = int(shifts[i].item())
-            # roll: смещение вдоль оси последовательности
-            shifted = hidden_states.roll(shifts=shift, dims=1)
-            # Чекпоинтинг для экономии памяти
+            shifted = hidden_states.roll(shifts=i * chunk, dims=1)
             out_i = self.mamba(shifted)
-            # Суммируем с учётом обучаемых коэффициентов
             head_outputs += out_i * weights[i]
 
         # Skip connection
