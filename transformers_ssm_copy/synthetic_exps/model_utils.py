@@ -6,7 +6,7 @@ from models import (
         GPTNeoXNoPEForCausalLM,
         )
 from transformers import  GPTNeoXForCausalLM, GPTNeoXConfig
-from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
+
 
 def get_model(args, tokenizer):
 
@@ -43,13 +43,16 @@ def get_model(args, tokenizer):
         model = GPTNeoXHardAlibiForCausalLM(config)
     elif args.model=="mamba":
         from mamba_ssm.models.config_mamba import MambaConfig
+        from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
         config = MambaConfig(
             d_model=args.hidden_size,
             n_layer=args.layers,
-            ssm_cfg={"d_state": args.state_dim},
+            ssm_cfg={"d_state": args.state_dim, "layer" : "Mamba2"},
+            # ssm_cfg={"d_state": args.state_dim},
             vocab_size=len(tokenizer)
         )
         model = MambaLMHeadModel(config)
+
     elif args.model=="lstm":
         model = LSTM(
                 embedding_dim=args.hidden_size,
