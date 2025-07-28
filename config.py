@@ -6,10 +6,10 @@ class Config:
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
     batch_size = 4
     embed_dim = 64
-    heads = 16
+    heads = 4
     num_layers = 12
-    num_epochs_wiki = 10
-    num_epochs_babilong = 10
+    num_epochs_wiki = 3
+    num_epochs_babilong = 3
 
 # 8k
     max_length = 8192

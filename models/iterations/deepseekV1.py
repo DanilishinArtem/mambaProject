@@ -9,38 +9,38 @@ import math
 import torch.nn.functional as F
 
 class MambaPlusPlus_layer(nn.Module):
-    def __init__(self, dim, num_heads, dropout=0.0, linear_attn_r=64):
+    def __init__(self, dim, num_heads, dropout=0.0, linear_attn_r=256):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
-        self.head_dim = dim
-        self.linear_attn_r = linear_attn_r  # Проекционная размерность для линейного внимания
+        self.linear_attn_r = linear_attn_r  # Проекция в r
 
-        # Нормализация
-        self.norm = RMSNorm(dim)  # Используем оригинальную RMSNorm
+        # LayerNorm для стабильности
+        self.norm = nn.LayerNorm(dim)
 
-        # Проекции QKV (объединенные для эффективности)
-        self.qkv_proj = nn.Linear(dim, dim * 3 * num_heads)
-        
-        # Линейное внимание: проекции для ключей и значений
+        # Объединённая QKV (не используем для линear-attn, но можно оставить)
+        self.qkv_proj = nn.Linear(dim, dim * 3)
+
+        # Проекции для линear-attn: q, k, v → размер r
         self.linear_attn_q_projs = nn.ModuleList([nn.Linear(dim, linear_attn_r) for _ in range(num_heads)])
         self.linear_attn_k_projs = nn.ModuleList([nn.Linear(dim, linear_attn_r) for _ in range(num_heads)])
+        self.linear_attn_v_projs = nn.ModuleList([nn.Linear(dim, linear_attn_r) for _ in range(num_heads)])
 
-        # ОРИГИНАЛЬНЫЕ Mamba-блоки для каждой головы
+        # Mamba-блокы (заменили на depthwise+pointwise conv, как в твоём примере)
         self.mamba_heads = nn.ModuleList([
-            create_block(
-                d_model=dim,
-                d_intermediate=0,
-                ssm_cfg={"d_state": 32, "layer": "Mamba2"},
-                layer_idx=i
-            ) for i in range(num_heads)
+            nn.Sequential(
+                nn.Conv1d(linear_attn_r, linear_attn_r, kernel_size=3, padding=1, groups=linear_attn_r),
+                nn.GELU(),
+                nn.Conv1d(linear_attn_r, dim, kernel_size=1),
+            )
+            for _ in range(num_heads)
         ])
 
-        # Гейт-механизм
+        # Гейтирование
         self.gate_proj = nn.Linear(dim, dim)
         self.gate_act = nn.Sigmoid()
 
-        # Выходная проекция
+        # Выходная проекция собирает num_heads*dim → dim
         self.out_proj = nn.Linear(dim * num_heads, dim)
         self.dropout = nn.Dropout(dropout)
         self.layer_scale = nn.Parameter(torch.ones(1) * 0.01)
@@ -53,41 +53,41 @@ class MambaPlusPlus_layer(nn.Module):
         # Pre-norm
         x_norm = self.norm(x)
 
-        # Объединенная проекция QKV
-        qkv = self.qkv_proj(x_norm).view(B, L, 3, self.num_heads, D).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]  # [B, num_heads, L, dim]
-
         head_outs = []
         for i in range(self.num_heads):
-            # Извлекаем данные для i-й головы
-            qi = q[:, i]  # [B, L, dim]
-            ki = k[:, i]
-            vi = v[:, i]
+            qi = x_norm
+            ki = x_norm
+            vi = x_norm
 
-            # Линейное внимание (O(L))
-            q_proj = F.elu(self.linear_attn_q_projs[i](qi)) + 1  # [B, L, r]
-            k_proj = F.elu(self.linear_attn_k_projs[i](ki)) + 1  # [B, L, r]
-            
-            # Вычисляем взвешенные значения через ассоциативность
-            kv = torch.einsum('blk,blv->bkv', k_proj, vi)  # [B, r, dim]
-            attn_out = torch.einsum('blk,bkv->blv', q_proj, kv)  # [B, L, dim]
-            
-            # Нормализация
-            z = 1.0 / (torch.einsum('blk->bl', q_proj) + 1e-6)  # [B, L]
-            attn_out = attn_out * z.unsqueeze(-1)  # [B, L, dim]
+            # Проекции q,k,v → [B, L, r]
+            q_proj = F.gelu(self.linear_attn_q_projs[i](qi))  # (B, L, r)
+            k_proj = F.gelu(self.linear_attn_k_projs[i](ki))  # (B, L, r)
+            v_proj = F.gelu(self.linear_attn_v_projs[i](vi))  # (B, L, r)
 
-            # ОРИГИНАЛЬНЫЙ Mamba-блок
-            mamba_out, _ = self.mamba_heads[i](attn_out)  # [B, L, dim]
-            
+            # Ассоциативная linear-attn
+            # kv: [B, r, r]
+            kv = torch.bmm(k_proj.transpose(1, 2), v_proj)
+            # attn_out: [B, L, r]
+            attn_out = torch.bmm(q_proj, kv)
+
+            # Нормировка по сумме q
+            z = 1.0 / (q_proj.sum(dim=-1, keepdim=True) + 1e-6)  # (B, L, 1)
+            attn_out = attn_out * z
+
+            # Mamba-блок через conv: нужно [B, r, L]
+            mamba_in = attn_out.transpose(1, 2)        # (B, r, L)
+            mamba_out = self.mamba_heads[i](mamba_in)  # (B, dim, L)
+            mamba_out = mamba_out.transpose(1, 2)      # (B, L, dim)
+
             head_outs.append(mamba_out)
 
-        # Гейт-механизм
-        gate = self.gate_act(self.gate_proj(x_norm))  # [B, L, dim]
-        gated_heads = [ho * gate for ho in head_outs]
-        combined = torch.cat(gated_heads, dim=-1)  # [B, L, dim * num_heads]
+        # Гейтирование
+        gate = self.gate_act(self.gate_proj(x_norm))  # (B, L, dim)
+        gated_heads = [h * gate for h in head_outs]   # по-головное умножение
 
-        # Выход
-        out = self.out_proj(combined)
+        # Конкатенация и выход
+        combined = torch.cat(gated_heads, dim=-1)     # (B, L, num_heads*dim)
+        out = self.out_proj(combined)                 # (B, L, dim)
         out = residual + self.dropout(out) * self.layer_scale
         return out, residual
 

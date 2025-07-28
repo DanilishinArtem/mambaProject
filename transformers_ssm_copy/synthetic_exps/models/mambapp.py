@@ -1,63 +1,95 @@
 import torch
 import torch.nn as nn
 from mamba_ssm import Mamba
+from mamba_ssm.modules.mamba2 import Mamba2
 from mamba_ssm.ops.triton.layer_norm import RMSNorm, layer_norm_fn
-
+from mamba_ssm.models.mixer_seq_simple import create_block
+from einops import rearrange, repeat
+import math
+import torch.nn.functional as F
 
 class MambaPlusPlus_layer(nn.Module):
-    def __init__(self, dim, num_heads, dropout=0.0):
+    def __init__(self, dim, num_heads, dropout=0.0, linear_attn_r=64):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
+        self.head_dim = dim
+        self.linear_attn_r = linear_attn_r  # Проекционная размерность для линейного внимания
 
-        # Mamba-блок для всех голов одновременно
-        self.mamba = Mamba(
-            d_model=dim,
-            d_state=16,
-            d_conv=4,
-            expand=2,
-        )
-        # Обучаемые веса для каждой головы (будут нормироваться через softmax)
-        self.head_weights = nn.Parameter(torch.ones(num_heads))
-        # Обучаемые сдвиги: доля длины последовательности для каждой головы
-        # Инициализация равномерным распределением по головам
-        init_shifts = torch.linspace(0.0, 1.0, num_heads)
-        self.head_shift_scales = nn.Parameter(init_shifts)
+        # Нормализация
+        self.norm = RMSNorm(dim)  # Используем оригинальную RMSNorm
 
-        self.norm = RMSNorm(dim)
+        # Проекции QKV (объединенные для эффективности)
+        self.qkv_proj = nn.Linear(dim, dim * 3 * num_heads)
+        
+        # Линейное внимание: проекции для ключей и значений
+        self.linear_attn_q_projs = nn.ModuleList([nn.Linear(dim, linear_attn_r) for _ in range(num_heads)])
+        self.linear_attn_k_projs = nn.ModuleList([nn.Linear(dim, linear_attn_r) for _ in range(num_heads)])
 
-    def forward(self, hidden_states, residual=None, padding_mask=None):
-        # Предварительная нормализация
-        hidden_states, residual = layer_norm_fn(
-            hidden_states,
-            self.norm.weight,
-            self.norm.bias,
-            prenorm=True,
-            residual=residual,
-            is_rms_norm=True
-        )
-        B, L, D = hidden_states.shape
-        H = self.num_heads
+        # ОРИГИНАЛЬНЫЕ Mamba-блоки для каждой головы
+        self.mamba_heads = nn.ModuleList([
+            create_block(
+                d_model=dim,
+                d_intermediate=0,
+                ssm_cfg={"d_state": 32, "layer": "Mamba2"},
+                layer_idx=i
+            ) for i in range(num_heads)
+        ])
 
-        # Нормируем head_weights
-        weights = torch.softmax(self.head_weights, dim=0)
-        # Вычисляем целочисленные сдвиги для roll
-        # head_shift_scales в диапазоне [0,1], умножаем на L и приводим к int
-        shifts = (self.head_shift_scales.clamp(0.0, 1.0) * L).floor().long()
+        # Гейт-механизм
+        self.gate_proj = nn.Linear(dim, dim)
+        self.gate_act = nn.Sigmoid()
 
-        head_outputs = torch.zeros_like(hidden_states)
-        for i in range(H):
-            shift = int(shifts[i].item())
-            # roll: смещение вдоль оси последовательности
-            shifted = hidden_states.roll(shifts=shift, dims=1)
-            # Чекпоинтинг для экономии памяти
-            out_i = self.mamba(shifted)
-            # Суммируем с учётом обучаемых коэффициентов
-            head_outputs += out_i * weights[i]
+        # Выходная проекция
+        self.out_proj = nn.Linear(dim * num_heads, dim)
+        self.dropout = nn.Dropout(dropout)
+        self.layer_scale = nn.Parameter(torch.ones(1) * 0.01)
 
-        # Skip connection
-        out = head_outputs + (residual if residual is not None else hidden_states)
-        return out, out
+    def forward(self, x, residual=None):
+        B, L, D = x.shape
+        if residual is None:
+            residual = x
+
+        # Pre-norm
+        x_norm = self.norm(x)
+
+        # Объединенная проекция QKV
+        qkv = self.qkv_proj(x_norm).view(B, L, 3, self.num_heads, D).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # [B, num_heads, L, dim]
+
+        head_outs = []
+        for i in range(self.num_heads):
+            # Извлекаем данные для i-й головы
+            qi = q[:, i]  # [B, L, dim]
+            ki = k[:, i]
+            vi = v[:, i]
+
+            # Линейное внимание (O(L))
+            q_proj = F.elu(self.linear_attn_q_projs[i](qi)) + 1  # [B, L, r]
+            k_proj = F.elu(self.linear_attn_k_projs[i](ki)) + 1  # [B, L, r]
+            
+            # Вычисляем взвешенные значения через ассоциативность
+            kv = torch.einsum('blk,blv->bkv', k_proj, vi)  # [B, r, dim]
+            attn_out = torch.einsum('blk,bkv->blv', q_proj, kv)  # [B, L, dim]
+            
+            # Нормализация
+            z = 1.0 / (torch.einsum('blk->bl', q_proj) + 1e-6)  # [B, L]
+            attn_out = attn_out * z.unsqueeze(-1)  # [B, L, dim]
+
+            # ОРИГИНАЛЬНЫЙ Mamba-блок
+            mamba_out, _ = self.mamba_heads[i](attn_out)  # [B, L, dim]
+            
+            head_outs.append(mamba_out)
+
+        # Гейт-механизм
+        gate = self.gate_act(self.gate_proj(x_norm))  # [B, L, dim]
+        gated_heads = [ho * gate for ho in head_outs]
+        combined = torch.cat(gated_heads, dim=-1)  # [B, L, dim * num_heads]
+
+        # Выход
+        out = self.out_proj(combined)
+        out = residual + self.dropout(out) * self.layer_scale
+        return out, residual
 
 
 class MambaPlusPlusML(nn.Module):
@@ -98,4 +130,4 @@ class MambaPlusPlusML(nn.Module):
             is_rms_norm=isinstance(self.norm_f, RMSNorm)
         )
         logits = self.lm_head(hidden_states)
-        return {"logits": logits}
+        return {"logits" : logits}
