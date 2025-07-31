@@ -33,33 +33,34 @@ def std_regularizer(W, M):
 
 
 class MambaPlusPlus_layer(nn.Module):
-    def __init__(self, dim, num_heads, d_state=None, d_conv=4, expand=2, dropout=0.0, M=1.0, epsilon=1e-5, T=512):
+    def __init__(self, dim, num_heads, d_state=None, d_conv=4, expand=2, dropout=0.0, M_init=1e-2, epsilon=1e-5, T=512):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.d_state = d_state
-        self.M = M  # Bound on matrix norms
-        self.epsilon = epsilon  # Error tolerance
-        self.T = T  # Sequence length
+        self.epsilon = epsilon
+        self.T = T
         self.d_inner = int(expand * dim)
-        self.dt_rank = math.ceil(self.dim / 16)  # Match Mamba's default
-        # Compute theoretical d_state if not provided
+        self.dt_rank = math.ceil(self.dim / 16)
+        self.M = M_init
+        # Compute theoretical d_state
         if d_state is None:
-            c, C = 1.0, 1.0  # Universal constants (can be tuned)
-            d_state = int((self.M**2 / (c * (self.dim**(5/2)))) * (
-                np.log(C * self.T * self.dim**2 / self.epsilon) + self.M**2 / np.sqrt(self.dim)
+            c, C = 1.0, 1.0
+            d_state = int((M_init**2 / (c * (self.dim**(5/2)))) * (
+                np.log(C * self.T * self.dim**2 / self.epsilon) + M_init**2 / np.sqrt(self.dim)
             ))
-            self.d_state = max(d_state, 32)  # Ensure minimum state size for stability
-
+            self.d_state = max(d_state, 32)
         print("[INFO] d_state: {}".format(self.d_state))
-        # Input projection to mimic W_q x_t and W_k x_s
+
+        # Input projection
         self.input_projection = nn.Linear(dim, dim)
-        self.alpha = nn.Parameter(torch.tensor(1.0))  # Learnable scaling for u_s ≈ α(t-s)
+        self.alpha = nn.Parameter(torch.tensor(1.0))
 
-        self.m_learnable = nn.Parameter(torch.tensor(float(np.log(np.expm1(M)))))  # Initialize such that softplus(m) ≈ M_init
-        self.M_learnable = lambda: nn.functional.softplus(self.m_learnable)  # Ensure M > 0
+        # Learnable normalization bound
+        self.m_learnable = nn.Parameter(torch.tensor(float(np.log(np.expm1(M_init)))))
+        self.M_learnable = lambda: nn.functional.softplus(self.m_learnable)
 
-        # Mamba block with optimized state dimension
+        # Mamba block
         self.mamba = Mamba(
             d_model=dim,
             d_state=self.d_state,
@@ -67,51 +68,87 @@ class MambaPlusPlus_layer(nn.Module):
             expand=expand,
         )
 
-        # Initialize Mamba parameters using Gaussian quadrature
+        self.num_heads = 8
+        # Exponential superposition parameters
+        self.coeff = nn.Parameter(torch.ones(self.num_heads) / self.num_heads)
+
+        # Initialize Mamba parameters
         self.initialize_mamba_params()
 
-        # Layer normalization
+        # Layer normalization and activation
         self.norm = RMSNorm(dim)
-        # Regularization function (applied non-in-place)
-        self.weight_regularizer = lambda x: torch.clamp(x, -M, M)
+        self.activation = nn.GELU()
+        self.weight_regularizer = lambda x, M: torch.clamp(x, -M, M)
+
+    def estimate_operator_norm(self, W, num_iterations=5):
+        v = torch.randn(W.shape[1], device=W.device)
+        v = v / torch.norm(v)
+        for _ in range(num_iterations):
+            u = W @ v
+            v = W.T @ u
+            v = v / torch.norm(v)
+        singular_value = torch.abs(torch.dot(u, W @ v)) / torch.norm(u)
+        return singular_value
+
+    def operator_norm_regularizer(self, W, epsilon=1e-8):
+        M = self.M_learnable()
+        norm = self.estimate_operator_norm(W)
+        scale = M / torch.clamp(norm, min=epsilon)
+        return W * scale
 
     def initialize_mamba_params(self):
-        # Initialize A and x_proj using Gaussian quadrature over [-a, a], a = M^2 / (d * d^1/2)
-        a = self.M**2 / (self.dim * self.dim**0.5)
-        nodes, weights = self.gaussian_quadrature(self.d_state, -a, a)
+        a = self.M_learnable()**2 / (self.dim * self.dim**0.5)
+        nodes, weights = self.gaussian_quadrature(self.d_state, -a.detach(), a.detach())
         
-        # Initialize A_log (diagonal A = -exp(A_log), shape (d_inner, d_state))
         with torch.no_grad():
             lambda_prime = torch.tensor(nodes, dtype=torch.float32, device=self.mamba.A_log.device)
-            A = -torch.exp(self.alpha * lambda_prime)  # Shape: (d_state,)
-            A = A.unsqueeze(0).repeat(self.d_inner, 1)  # Shape: (d_inner, d_state)
-            self.mamba.A_log.copy_(torch.log(torch.abs(A)))  # A_log stores log(|A|)
+            A = -torch.exp(self.alpha * lambda_prime)
+            A = A.unsqueeze(0).repeat(self.d_inner, 1)
+            self.mamba.A_log.copy_(torch.log(torch.abs(A)))
 
-        # Initialize x_proj to produce B and C resembling Gaussian quadrature weights
-        with torch.no_grad():
             weights = torch.tensor(weights, dtype=torch.float32, device=self.mamba.x_proj.weight.device)
-            weights = weights / weights.abs().max()  # Normalize for stability
-            x_proj_weight = self.mamba.x_proj.weight  # Shape: (dt_rank + 2 * d_state, d_inner)
-            b_weight = x_proj_weight[self.dt_rank:self.dt_rank + self.d_state, :]  # Shape: (d_state, d_inner)
-            c_weight = x_proj_weight[self.dt_rank + self.d_state:, :]  # Shape: (d_state, d_inner)
-            weights = weights.unsqueeze(1).repeat(1, self.d_inner)  # Shape: (d_state, d_inner)
+            weights = weights / weights.abs().max()
+            x_proj_weight = self.mamba.x_proj.weight
+            b_weight = x_proj_weight[self.dt_rank:self.dt_rank + self.d_state, :]
+            c_weight = x_proj_weight[self.dt_rank + self.d_state:, :]
+            weights = weights.unsqueeze(1).repeat(1, self.d_inner)
             b_weight.copy_(weights)
             c_weight.copy_(weights)
 
     def gaussian_quadrature(self, n, a, b):
-        # Generate n Gaussian quadrature nodes and weights over [a, b]
         nodes, weights = np.polynomial.legendre.leggauss(n)
         nodes = (b - a) / 2 * nodes + (b + a) / 2
         weights = (b - a) / 2 * weights
         return nodes, weights
+    
+    def factorial(self, n):
+        if n == 0:
+            return 1
+        else:
+            return n * self.factorial(n - 1)
 
     def forward(self, hidden_states, residual=None, padding_mask=None):
-        # Apply input projection with regularized weights (non-in-place)
-        regularized_weight = self.weight_regularizer(self.input_projection.weight)
+        # Apply input projection with regularized weights
+        regularized_weight = self.operator_norm_regularizer(self.input_projection.weight)
         projected_states = nn.functional.linear(hidden_states, regularized_weight, self.input_projection.bias)
-        modulated_states = projected_states * self.alpha
 
-        # Apply Mamba layer to modulated states
+        # Compute u_s approximation: u_s ≈ α(t-s)
+        batch, seq_len, dim = hidden_states.shape
+        t = torch.arange(seq_len, device=hidden_states.device).float()
+        t_diff = (t.unsqueeze(1) - t.unsqueeze(0)).unsqueeze(0).repeat(batch, 1, 1)
+        u_s = torch.zeros_like(t_diff, device=t_diff.device)
+        for h in range(self.num_heads):
+            u_s += self.coeff[h] * torch.pow(t_diff, h) / self.factorial(h)
+        # u_s = torch.clamp(u_s, -self.M_learnable()**2 / (self.dim * self.dim**0.5), self.M_learnable()**2 / (self.dim * self.dim**0.5))
+        u_s = torch.clamp(u_s, -self.M_learnable(), self.M_learnable())
+        # Compute attention-like scores
+        d = self.dim
+        exp_d_us = torch.exp(d * u_s)
+        Z_t = torch.sum(exp_d_us, dim=-1, keepdim=True)
+        attention_weights = exp_d_us / (Z_t + 1e-8)
+        modulated_states = torch.bmm(attention_weights, projected_states)
+
+        # Apply Mamba layer
         modulated_states, residual = layer_norm_fn(
             modulated_states,
             self.norm.weight,
@@ -121,7 +158,7 @@ class MambaPlusPlus_layer(nn.Module):
             is_rms_norm=True
         )
         mamba_out = self.mamba(modulated_states)
-
+        mamba_out = self.activation(mamba_out)
         return mamba_out, residual
 
     def estimate_operator_norm(self, W, num_iterations=5):
@@ -144,9 +181,9 @@ class MambaPlusPlus_layer(nn.Module):
     def apply_weight_regularization(self):
         # Apply regularization to weights after forward/backward pass (e.g., in training loop)
         with torch.no_grad():
-            self.input_projection.weight.copy_(self.weight_regularizer(self.input_projection.weight))
-            self.mamba.x_proj.weight.copy_(self.weight_regularizer(self.mamba.x_proj.weight))
-            self.mamba.out_proj.weight.copy_(self.weight_regularizer(self.mamba.out_proj.weight))
+            self.input_projection.weight.copy_(self.weight_regularizer(self.input_projection.weight, self.M_learnable()))
+            self.mamba.x_proj.weight.copy_(self.weight_regularizer(self.mamba.x_proj.weight, self.M_learnable()))
+            self.mamba.out_proj.weight.copy_(self.weight_regularizer(self.mamba.out_proj.weight, self.M_learnable()))
 
             # self.input_projection.weight.copy_(self.operator_norm_regularizer(self.input_projection.weight))
             # self.mamba.x_proj.weight.copy_(self.operator_norm_regularizer(self.mamba.x_proj.weight))
