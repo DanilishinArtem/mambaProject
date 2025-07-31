@@ -107,6 +107,9 @@ def train(args,model, train_dataset, tokenizer, TO_TOKEN):
             if step > num_training_steps:
                 break
 
+            if args.model=="mambapp":
+                for item in model.layers:
+                    item.apply_weight_regularization()
             # Update tqdm description with the current loss
             progress_bar.set_postfix({'Loss': loss.item()})
             writer.add_scalar("Train/Loss", loss.item(), step)

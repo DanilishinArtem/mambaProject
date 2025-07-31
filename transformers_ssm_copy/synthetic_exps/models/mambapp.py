@@ -7,89 +7,150 @@ from mamba_ssm.models.mixer_seq_simple import create_block
 from einops import rearrange, repeat
 import math
 import torch.nn.functional as F
+import numpy as np
+print("[INFO] HIMARK")
+
+def estimate_operator_norm(W, num_iterations=5):
+    # Power iteration to approximate the largest singular value
+    v = torch.randn(W.shape[1], device=W.device)
+    v = v / torch.norm(v)
+    for _ in range(num_iterations):
+        u = W @ v
+        v = W.T @ u
+        v = v / torch.norm(v)
+    singular_value = torch.abs(torch.dot(u, W @ v)) / torch.norm(u)
+    return singular_value
+
+def operator_norm_regularizer(W, M, epsilon=1e-8):
+    norm = estimate_operator_norm(W)
+    scale = M / torch.clamp(norm, min=epsilon)
+    return W * scale
+
+def std_regularizer(W, M):
+    std = torch.std(W, unbiased=False)
+    return W * (M / torch.clamp(std, min=1e-8))
+
+
 
 class MambaPlusPlus_layer(nn.Module):
-    def __init__(self, dim, num_heads, dropout=0.0, linear_attn_r=64):
+    def __init__(self, dim, num_heads, d_state=None, d_conv=4, expand=2, dropout=0.0, M=1.0, epsilon=1e-5, T=512):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
-        self.head_dim = dim
-        self.linear_attn_r = linear_attn_r  # Проекционная размерность для линейного внимания
+        self.d_state = d_state
+        self.M = M  # Bound on matrix norms
+        self.epsilon = epsilon  # Error tolerance
+        self.T = T  # Sequence length
+        self.d_inner = int(expand * dim)
+        self.dt_rank = math.ceil(self.dim / 16)  # Match Mamba's default
+        # Compute theoretical d_state if not provided
+        if d_state is None:
+            c, C = 1.0, 1.0  # Universal constants (can be tuned)
+            d_state = int((self.M**2 / (c * (self.dim**(5/2)))) * (
+                np.log(C * self.T * self.dim**2 / self.epsilon) + self.M**2 / np.sqrt(self.dim)
+            ))
+            self.d_state = max(d_state, 32)  # Ensure minimum state size for stability
 
-        # Нормализация
-        self.norm = RMSNorm(dim)  # Используем оригинальную RMSNorm
+        print("[INFO] d_state: {}".format(self.d_state))
+        # Input projection to mimic W_q x_t and W_k x_s
+        self.input_projection = nn.Linear(dim, dim)
+        self.alpha = nn.Parameter(torch.tensor(1.0))  # Learnable scaling for u_s ≈ α(t-s)
 
-        # Проекции QKV (объединенные для эффективности)
-        self.qkv_proj = nn.Linear(dim, dim * 3 * num_heads)
+        self.m_learnable = nn.Parameter(torch.tensor(float(np.log(np.expm1(M)))))  # Initialize such that softplus(m) ≈ M_init
+        self.M_learnable = lambda: nn.functional.softplus(self.m_learnable)  # Ensure M > 0
+
+        # Mamba block with optimized state dimension
+        self.mamba = Mamba(
+            d_model=dim,
+            d_state=self.d_state,
+            d_conv=d_conv,
+            expand=expand,
+        )
+
+        # Initialize Mamba parameters using Gaussian quadrature
+        self.initialize_mamba_params()
+
+        # Layer normalization
+        self.norm = RMSNorm(dim)
+        # Regularization function (applied non-in-place)
+        self.weight_regularizer = lambda x: torch.clamp(x, -M, M)
+
+    def initialize_mamba_params(self):
+        # Initialize A and x_proj using Gaussian quadrature over [-a, a], a = M^2 / (d * d^1/2)
+        a = self.M**2 / (self.dim * self.dim**0.5)
+        nodes, weights = self.gaussian_quadrature(self.d_state, -a, a)
         
-        # Линейное внимание: проекции для ключей и значений
-        self.linear_attn_q_projs = nn.ModuleList([nn.Linear(dim, linear_attn_r) for _ in range(num_heads)])
-        self.linear_attn_k_projs = nn.ModuleList([nn.Linear(dim, linear_attn_r) for _ in range(num_heads)])
+        # Initialize A_log (diagonal A = -exp(A_log), shape (d_inner, d_state))
+        with torch.no_grad():
+            lambda_prime = torch.tensor(nodes, dtype=torch.float32, device=self.mamba.A_log.device)
+            A = -torch.exp(self.alpha * lambda_prime)  # Shape: (d_state,)
+            A = A.unsqueeze(0).repeat(self.d_inner, 1)  # Shape: (d_inner, d_state)
+            self.mamba.A_log.copy_(torch.log(torch.abs(A)))  # A_log stores log(|A|)
 
-        # ОРИГИНАЛЬНЫЕ Mamba-блоки для каждой головы
-        self.mamba_heads = nn.ModuleList([
-            create_block(
-                d_model=dim,
-                d_intermediate=0,
-                ssm_cfg={"d_state": 32, "layer": "Mamba2"},
-                layer_idx=i
-            ) for i in range(num_heads)
-        ])
+        # Initialize x_proj to produce B and C resembling Gaussian quadrature weights
+        with torch.no_grad():
+            weights = torch.tensor(weights, dtype=torch.float32, device=self.mamba.x_proj.weight.device)
+            weights = weights / weights.abs().max()  # Normalize for stability
+            x_proj_weight = self.mamba.x_proj.weight  # Shape: (dt_rank + 2 * d_state, d_inner)
+            b_weight = x_proj_weight[self.dt_rank:self.dt_rank + self.d_state, :]  # Shape: (d_state, d_inner)
+            c_weight = x_proj_weight[self.dt_rank + self.d_state:, :]  # Shape: (d_state, d_inner)
+            weights = weights.unsqueeze(1).repeat(1, self.d_inner)  # Shape: (d_state, d_inner)
+            b_weight.copy_(weights)
+            c_weight.copy_(weights)
 
-        # Гейт-механизм
-        self.gate_proj = nn.Linear(dim, dim)
-        self.gate_act = nn.Sigmoid()
+    def gaussian_quadrature(self, n, a, b):
+        # Generate n Gaussian quadrature nodes and weights over [a, b]
+        nodes, weights = np.polynomial.legendre.leggauss(n)
+        nodes = (b - a) / 2 * nodes + (b + a) / 2
+        weights = (b - a) / 2 * weights
+        return nodes, weights
 
-        # Выходная проекция
-        self.out_proj = nn.Linear(dim * num_heads, dim)
-        self.dropout = nn.Dropout(dropout)
-        self.layer_scale = nn.Parameter(torch.ones(1) * 0.01)
+    def forward(self, hidden_states, residual=None, padding_mask=None):
+        # Apply input projection with regularized weights (non-in-place)
+        regularized_weight = self.weight_regularizer(self.input_projection.weight)
+        projected_states = nn.functional.linear(hidden_states, regularized_weight, self.input_projection.bias)
+        modulated_states = projected_states * self.alpha
 
-    def forward(self, x, residual=None):
-        B, L, D = x.shape
-        if residual is None:
-            residual = x
+        # Apply Mamba layer to modulated states
+        modulated_states, residual = layer_norm_fn(
+            modulated_states,
+            self.norm.weight,
+            self.norm.bias,
+            prenorm=True,
+            residual=residual,
+            is_rms_norm=True
+        )
+        mamba_out = self.mamba(modulated_states)
 
-        # Pre-norm
-        x_norm = self.norm(x)
+        return mamba_out, residual
 
-        # Объединенная проекция QKV
-        qkv = self.qkv_proj(x_norm).view(B, L, 3, self.num_heads, D).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]  # [B, num_heads, L, dim]
+    def estimate_operator_norm(self, W, num_iterations=5):
+        # Power iteration to approximate the largest singular value
+        v = torch.randn(W.shape[1], device=W.device)
+        v = v / torch.norm(v)
+        for _ in range(num_iterations):
+            u = W @ v
+            v = W.T @ u
+            v = v / torch.norm(v)
+        singular_value = torch.abs(torch.dot(u, W @ v)) / torch.norm(u)
+        return singular_value
 
-        head_outs = []
-        for i in range(self.num_heads):
-            # Извлекаем данные для i-й головы
-            qi = q[:, i]  # [B, L, dim]
-            ki = k[:, i]
-            vi = v[:, i]
+    def operator_norm_regularizer(self, W, epsilon=1e-8):
+        M = self.M_learnable()  # Use learnable bound
+        norm = self.estimate_operator_norm(W)
+        scale = M / torch.clamp(norm, min=epsilon)
+        return W * scale
+    
+    def apply_weight_regularization(self):
+        # Apply regularization to weights after forward/backward pass (e.g., in training loop)
+        with torch.no_grad():
+            self.input_projection.weight.copy_(self.weight_regularizer(self.input_projection.weight))
+            self.mamba.x_proj.weight.copy_(self.weight_regularizer(self.mamba.x_proj.weight))
+            self.mamba.out_proj.weight.copy_(self.weight_regularizer(self.mamba.out_proj.weight))
 
-            # Линейное внимание (O(L))
-            q_proj = F.elu(self.linear_attn_q_projs[i](qi)) + 1  # [B, L, r]
-            k_proj = F.elu(self.linear_attn_k_projs[i](ki)) + 1  # [B, L, r]
-            
-            # Вычисляем взвешенные значения через ассоциативность
-            kv = torch.einsum('blk,blv->bkv', k_proj, vi)  # [B, r, dim]
-            attn_out = torch.einsum('blk,bkv->blv', q_proj, kv)  # [B, L, dim]
-            
-            # Нормализация
-            z = 1.0 / (torch.einsum('blk->bl', q_proj) + 1e-6)  # [B, L]
-            attn_out = attn_out * z.unsqueeze(-1)  # [B, L, dim]
-
-            # ОРИГИНАЛЬНЫЙ Mamba-блок
-            mamba_out, _ = self.mamba_heads[i](attn_out)  # [B, L, dim]
-            
-            head_outs.append(mamba_out)
-
-        # Гейт-механизм
-        gate = self.gate_act(self.gate_proj(x_norm))  # [B, L, dim]
-        gated_heads = [ho * gate for ho in head_outs]
-        combined = torch.cat(gated_heads, dim=-1)  # [B, L, dim * num_heads]
-
-        # Выход
-        out = self.out_proj(combined)
-        out = residual + self.dropout(out) * self.layer_scale
-        return out, residual
+            # self.input_projection.weight.copy_(self.operator_norm_regularizer(self.input_projection.weight))
+            # self.mamba.x_proj.weight.copy_(self.operator_norm_regularizer(self.mamba.x_proj.weight))
+            # self.mamba.out_proj.weight.copy_(self.operator_norm_regularizer(self.mamba.out_proj.weight))
 
 
 class MambaPlusPlusML(nn.Module):

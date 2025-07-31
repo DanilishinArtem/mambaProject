@@ -1,9 +1,8 @@
 # rm -rf /home/adanilishin/mambaProject/transformers_ssm_copy/tensorboard
-# python3 synthetic_exps/main.py --model "mambapp" --train_task "suffix_ngram" --eval_task  "suffix_ngram" --min_train_len 150 --max_train_len 200 --min_eval_len 195 --max_eval_len 200 --steps 500 --heads 1 --n_gram 100 --context_len 420
+# python3 synthetic_exps/main.py --model "mambapp" --train_task "copy" --eval_task  "copy" --min_train_len 5 --max_train_len 100 --min_eval_len 95 --max_eval_len 100 --steps 2000 --heads 0 --n_gram 0 --context_len 220
+python3 synthetic_exps/main.py --model "mambapp" --train_task "copy" --eval_task  "copy" --min_train_len 5 --max_train_len 20 --min_eval_len 15 --max_eval_len 20 --steps 2000 --heads 0 --n_gram 0 --context_len 44
 
 # rm -rf /home/adanilishin/mambaProject/transformers_ssm_copy/tensorboard/model_mambapp_layer_12_hidden_1024_heads_8_train_copy_lr_1e-05_epochs_1_steps_300
-python3 synthetic_exps/main.py --model "mambapp" --train_task "copy" --eval_task  "copy" --min_train_len 50 --max_train_len 100 --min_eval_len 95 --max_eval_len 100 --steps 2000 --heads 4 --n_gram 0 --context_len 220 #--layers 1
-# python3 synthetic_exps/main.py --model "mambapp" --train_task "copy" --eval_task  "copy" --min_train_len 5 --max_train_len 20 --min_eval_len 95 --max_eval_len 100 --steps 2000 --heads 4 --n_gram 0 --context_len 44 #--layers 1
 
 # одну мамбу в качестве всех голов
 # поиграться с d_state
