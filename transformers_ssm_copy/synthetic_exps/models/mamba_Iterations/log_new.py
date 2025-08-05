@@ -182,32 +182,16 @@ class MixerModel(nn.Module):
         )
         
         # Additional parameters:
-        self.num_heads = 8
+        self.num_heads = 1
         self.disp = 10
-        
-        # temp = 220
-        # self.layer_exp_coeff = nn.ModuleList([
-        #     nn.Linear(temp, temp, bias=True) for _ in range(n_layer)
-        # ])
-        # self.layer_coeff = nn.ModuleList([
-        #     nn.Linear(temp, temp, bias=True) for _ in range(n_layer)
-        # ])
-
-        self.layer_exp_coeff = nn.ParameterList([
-            nn.Parameter(torch.ones(self.num_heads) / self.disp) for _ in range(n_layer)
-        ])
-        self.layer_exp_bias = nn.ParameterList([
-            nn.Parameter(torch.zeros(self.num_heads)) for _ in range(n_layer)
-        ])
-        self.layer_coeff = nn.ParameterList([
-            nn.Parameter(torch.ones(self.num_heads) / self.disp) for _ in range(n_layer)
-        ])
-
-        self.layer_input_projection = nn.ModuleList([
-            nn.Linear(d_model, d_model, bias=True) for _ in range(n_layer)
-        ])
-        self.activations = nn.ModuleList([nn.GELU() for _ in range(n_layer)])
-        self.head_proj = nn.Linear(d_model, d_model * self.num_heads, bias=False)
+        self.layer_exp_coeff = [nn.Parameter(torch.ones(self.num_heads) / self.disp) for i in range(n_layer)]
+        self.layer_coeff = [nn.Parameter(torch.ones(self.num_heads) / self.disp) for i in range(n_layer)]
+        self.layer_input_projection = nn.ModuleList(
+            [
+                nn.Linear(d_model, d_model, bias=True) for i in range(n_layer)
+            ]
+        )
+        self.activations = [nn.GELU() for i in range(n_layer)]
         # End of additional parameters ...
 
 
@@ -218,31 +202,45 @@ class MixerModel(nn.Module):
             for i, layer in enumerate(self.layers)
         }
     
+    def estimate_operator_norm(self, W, num_iterations=5):
+        # Power iteration to approximate the largest singular value
+        v = torch.randn(W.shape[1], device=W.device)
+        v = v / torch.norm(v)
+        for _ in range(num_iterations):
+            u = W @ v
+            v = W.T @ u
+            v = v / torch.norm(v)
+        singular_value = torch.abs(torch.dot(u, W @ v)) / torch.norm(u)
+        return singular_value
+    
+    def operator_norm_regularizer(self, W, Layer, epsilon=1e-8):
+        M = nn.functional.softplus(self.M_learnable[Layer])
+        norm = self.estimate_operator_norm(W)
+        scale = M / torch.clamp(norm, min=epsilon)
+        return W * scale
+
     def forward(self, input_ids, inference_params=None, **mixer_kwargs):
         hidden_states = self.embedding(input_ids)
         residual = None
         for idx_layer, layer in enumerate(self.layers):
                                             # ............... Start of modification ...............
             batch, seq_len, dim = hidden_states.shape
-            projected_states = self.layer_input_projection[idx_layer](hidden_states)
+            projected_states = nn.functional.linear(hidden_states, self.layer_input_projection[idx_layer].weight, self.layer_input_projection[idx_layer].bias)
             # Compute u_s approximation: u_s ≈ α(t-s)
             t = torch.arange(seq_len, device=hidden_states.device).float()
-            t_diff = (t.unsqueeze(1) - t.unsqueeze(0)).unsqueeze(0).repeat(batch, 1, 1) #/ seq_len
-            attention_weights = torch.zeros(batch, seq_len, seq_len, self.num_heads, device=hidden_states.device)
+            t_diff = (t.unsqueeze(1) - t.unsqueeze(0)).unsqueeze(0).repeat(batch, 1, 1)
+            attention_weights = torch.zeros_like(t_diff, device=t_diff.device)
             for h in range(self.num_heads):
-                # attention_weights[..., h] = self.layer_coeff[idx_layer].weight[:seq_len,:seq_len] @ (torch.exp(-self.layer_exp_coeff[idx_layer].weight[:seq_len,:seq_len] @ (t_diff.abs()) + self.layer_exp_coeff[idx_layer].bias[:seq_len]))
-                attention_weights[..., h] = self.layer_coeff[idx_layer][h] * torch.exp(-self.layer_exp_coeff[idx_layer][h] * t_diff + self.layer_exp_bias[idx_layer][h])
-            attention_weights = torch.sum(attention_weights, dim=-1)  # Shape: [batch, seq_len, seq_len]
+                attention_weights += self.layer_coeff[idx_layer][h] * torch.exp(-self.layer_exp_coeff[idx_layer][h] * t_diff)
             mask = torch.tril(torch.ones(seq_len, seq_len, device=hidden_states.device)).unsqueeze(0)
             attention_weights = attention_weights * mask
-            # attention_weights = nn.functional.softmax(attention_weights, dim=-1)  # Normalize over the last dimension
-            # Apply mask before summing over heads
+            attention_weights = nn.functional.softmax(attention_weights, dim=-1)
             hidden_states = torch.bmm(attention_weights, projected_states)
                                             # ............... End of modification ...............
             hidden_states, residual = layer(
                 hidden_states, residual, inference_params=inference_params, **mixer_kwargs
             )
-            # hidden_states = self.activations[idx_layer](hidden_states)
+            hidden_states = self.activations[idx_layer](hidden_states)
         if not self.fused_add_norm:
             residual = (hidden_states + residual) if residual is not None else hidden_states
             hidden_states = self.norm_f(residual.to(dtype=self.norm_f.weight.dtype))

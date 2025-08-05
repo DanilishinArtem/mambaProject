@@ -67,7 +67,7 @@ def evaluation(args, model, tokenizer, TO_TOKEN):
                 if args.model=="lstm":
                     state = model.init_hidden(args.eval_batch_size, 'cuda')
                     logits, state = model(x, state)
-                elif args.model=="mamba":
+                elif args.model=="mamba" or args.model=="mambapp":
                     logits = model(x)[0]
                 else:
                     logits = model(x)['logits']

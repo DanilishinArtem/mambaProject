@@ -84,12 +84,9 @@ def train(args,model, train_dataset, tokenizer, TO_TOKEN):
             else:
                logits = model(x)
 
-            if args.model=="mamba":
+            if args.model=="mamba" or args.model=="mambapp":
                 logits = logits[0]
             
-            if args.model=="mambapp":
-                logits = logits['logits']
-
             loss = ce_loss(y, logits, mask, TO_TOKEN)
             if (step+1) % num_log_steps == 0:
                 avg_loss.append(0)
@@ -107,9 +104,6 @@ def train(args,model, train_dataset, tokenizer, TO_TOKEN):
             if step > num_training_steps:
                 break
 
-            if args.model=="mambapp":
-                for item in model.layers:
-                    item.apply_weight_regularization()
             # Update tqdm description with the current loss
             progress_bar.set_postfix({'Loss': loss.item()})
             writer.add_scalar("Train/Loss", loss.item(), step)

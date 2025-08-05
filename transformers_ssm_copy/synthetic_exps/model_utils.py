@@ -48,7 +48,6 @@ def get_model(args, tokenizer):
             d_model=args.hidden_size,
             n_layer=args.layers,
             ssm_cfg={"d_state": args.state_dim, "layer" : "Mamba2"},
-            # ssm_cfg={"d_state": args.state_dim},
             vocab_size=len(tokenizer)
         )
         model = MambaLMHeadModel(config)
@@ -62,15 +61,12 @@ def get_model(args, tokenizer):
                 )
     elif args.model=="mambapp":
         from models.mambapp import MambaPlusPlusML
-        # def __init__(self, vocab_size, dim, num_layers, num_heads, max_seq_len, dropout=0.1):
-        model = MambaPlusPlusML(
-            vocab_size=len(tokenizer),
-            dim=args.hidden_size,
-            num_layers=args.layers,
-            num_heads=args.heads,
-            max_seq_len=1024
+        from mamba_ssm.models.config_mamba import MambaConfig
+        config = MambaConfig(
+            d_model=args.hidden_size,
+            n_layer=args.layers,
+            ssm_cfg={"d_state": args.state_dim, "layer" : "Mamba2"},
+            vocab_size=len(tokenizer)
         )
-        
+        model = MambaPlusPlusML(config)
     return model
-
-

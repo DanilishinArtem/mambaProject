@@ -41,7 +41,7 @@ def give_vanilla_mamba():
     vanilla_mamba = create_block(
         d_model=Config.embed_dim,
         d_intermediate=0,
-        ssm_cfg={"d_state": 48, "layer": "Mamba2"},
+        ssm_cfg={"d_state": 32, "layer": "Mamba2"},
         layer_idx=0
     )
     return vanilla_mamba
@@ -91,6 +91,8 @@ def approximation(transformer_block, mamba_block, seq_len, max_t, tag):
         loss.backward()
         optimizer.step()
 
+        mamba_block.apply_weight_regularization()
+
         writer.add_scalar("Loss_of_approximation", loss.item(), step)
 
         if step % 100 == 0:
@@ -101,11 +103,12 @@ if __name__ == "__main__":
     fix_seeds()
     max_t = 5000
     seq_len = 4096
-    heads = 0
+    heads = 1
     transformer_block = give_transformer_block(seq_len)
-    # mamba_block = give_mamba_block(heads)
-    mamba_block = give_vanilla_mamba()
+    mamba_block = give_mamba_block(heads)
+    # mamba_block = give_vanilla_mamba()
 
     print("[INFO] Running approximation procedure ... ")
+    # approximation(transformer_block=transformer_block, mamba_block=mamba_block, seq_len=seq_len, max_t=max_t, tag="vanilla".format(heads))
     approximation(transformer_block=transformer_block, mamba_block=mamba_block, seq_len=seq_len, max_t=max_t, tag="head{}".format(heads))
     print("[INFO] End of approximation ... ")
