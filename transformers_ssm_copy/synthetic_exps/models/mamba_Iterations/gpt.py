@@ -132,139 +132,118 @@ class MixerModel(nn.Module):
         residual_in_fp32=False,
         device=None,
         dtype=None,
+        low_rank_dim: int = 16,
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.residual_in_fp32 = residual_in_fp32
-
         self.embedding = nn.Embedding(vocab_size, d_model, **factory_kwargs)
-
-        # We change the order of residual and layer norm:
-        # Instead of LN -> Attn / MLP -> Add, we do:
-        # Add -> LN -> Attn / MLP / Mixer, returning both the residual branch (output of Add) and
-        # the main branch (output of MLP / Mixer). The model definition is unchanged.
-        # This is for performance reason: we can fuse add + layer_norm.
         self.fused_add_norm = fused_add_norm
-        if self.fused_add_norm:
-            if layer_norm_fn is None or rms_norm_fn is None:
-                raise ImportError("Failed to import Triton LayerNorm / RMSNorm kernels")
 
-        self.layers = nn.ModuleList(
-            [
-                create_block(
-                    d_model,
-                    d_intermediate=d_intermediate,
-                    ssm_cfg=ssm_cfg,
-                    attn_layer_idx=attn_layer_idx,
-                    attn_cfg=attn_cfg,
-                    norm_epsilon=norm_epsilon,
-                    rms_norm=rms_norm,
-                    residual_in_fp32=residual_in_fp32,
-                    fused_add_norm=fused_add_norm,
-                    layer_idx=i,
-                    **factory_kwargs,
-                )
-                for i in range(n_layer)
-            ]
-        )
+        self.layers = nn.ModuleList([
+            create_block(
+                d_model,
+                d_intermediate=d_intermediate,
+                ssm_cfg=ssm_cfg,
+                attn_layer_idx=attn_layer_idx,
+                attn_cfg=attn_cfg,
+                norm_epsilon=norm_epsilon,
+                rms_norm=rms_norm,
+                residual_in_fp32=residual_in_fp32,
+                fused_add_norm=fused_add_norm,
+                layer_idx=i,
+                **factory_kwargs,
+            )
+            for i in range(n_layer)
+        ])
 
         self.norm_f = (nn.LayerNorm if not rms_norm else RMSNorm)(
             d_model, eps=norm_epsilon, **factory_kwargs
         )
+
+        self.num_heads = 8
+        self.low_rank_dim = low_rank_dim
+
+        self.layer_exp_coeff = nn.ParameterList([
+            nn.Parameter(torch.ones(self.num_heads) * 0.1) for _ in range(n_layer)
+        ])
+        self.layer_exp_bias = nn.ParameterList([
+            nn.Parameter(torch.zeros(self.num_heads)) for _ in range(n_layer)
+        ])
+        self.layer_coeff = nn.ParameterList([
+            nn.Parameter(torch.ones(self.num_heads) * 0.1) for _ in range(n_layer)
+        ])
+
+        self.layer_input_projection = nn.ModuleList([
+            nn.Linear(d_model, d_model, bias=True) for _ in range(n_layer)
+        ])
+        self.value_projections = nn.ModuleList([
+            nn.Linear(d_model, low_rank_dim, bias=False) for _ in range(n_layer)
+        ])
+        self.output_projections = nn.ModuleList([
+            nn.Linear(low_rank_dim, d_model, bias=False) for _ in range(n_layer)
+        ])
+
+        self.rff_weights = nn.ParameterList([
+            nn.Parameter(torch.randn(self.num_heads, low_rank_dim) * 0.1)
+            for _ in range(n_layer)
+        ])
 
         self.apply(
             partial(
                 _init_weights,
                 n_layer=n_layer,
                 **(initializer_cfg if initializer_cfg is not None else {}),
-                n_residuals_per_layer=1 if d_intermediate == 0 else 2,  # 2 if we have MLP
+                n_residuals_per_layer=1 if d_intermediate == 0 else 2,
             )
         )
-        
-        # Additional parameters:
-        self.num_heads = 8
-        self.disp = 10
-        self.layer_exp_coeff = nn.ParameterList([
-            nn.Parameter(torch.ones(self.num_heads), requires_grad=True) for _ in range(n_layer)
-        ])
-        self.layer_exp_bias = nn.ParameterList([
-            nn.Parameter(torch.zeros(self.num_heads), requires_grad=True) for _ in range(n_layer)
-        ])
-        self.layer_coeff = nn.ParameterList([
-            nn.Parameter(torch.ones(self.num_heads), requires_grad=True) for _ in range(n_layer)
-        ])
 
-        self.layer_input_projection = nn.ModuleList([
-            nn.Linear(d_model, d_model * self.num_heads, bias=True) for _ in range(n_layer)
-        ])
-
-        self.gate_proj = nn.ModuleList([
-            nn.Linear(d_model, d_model) for _ in range(n_layer)
-        ])
-        # End of additional parameters ...
-
-
-
-    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
-        return {
-            i: layer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
-            for i, layer in enumerate(self.layers)
-        }
-    
     def forward(self, input_ids, inference_params=None, **mixer_kwargs):
         hidden_states = self.embedding(input_ids)
         residual = None
+
         for idx_layer, layer in enumerate(self.layers):
-            # =============== НАЧАЛО ИСПРАВЛЕННОЙ МОДИФИКАЦИИ ===============
             batch, seq_len, dim = hidden_states.shape
             projected_states = self.layer_input_projection[idx_layer](hidden_states)
-            
-            # Проверка кратности размерности
-            head_dim = dim
-            # assert self.num_heads * head_dim == dim, f"d_model {dim} must be divisible by num_heads {self.num_heads}"
-            
-            # Реструктуризация в [batch, num_heads, head_dim, seq_len]
-            projected_states = projected_states.view(batch, seq_len, self.num_heads, head_dim)
-            projected_states = projected_states.permute(0, 2, 3, 1)  # [batch, num_heads, head_dim, seq_len]
-            
-            # Получение параметров
-            exp_coeff = self.layer_exp_coeff[idx_layer]  # [num_heads]
-            coeff = self.layer_coeff[idx_layer]          # [num_heads]
-            exp_bias = self.layer_exp_bias[idx_layer]    # [num_heads]
-            
-            # Нормализованные временные метки
-            t = torch.linspace(0, 1, seq_len, device=hidden_states.device)
-            
-            # Вычисление компонентов разложения
-            decay = torch.exp(-exp_coeff.unsqueeze(1) * t.unsqueeze(0))  # [num_heads, seq_len]
-            impulse = (coeff * torch.exp(exp_bias)).unsqueeze(1) * torch.exp(exp_coeff.unsqueeze(1) * t.unsqueeze(0))  # [num_heads, seq_len]
-            
-            # Применение импульса к входным данным
-            weighted_input = projected_states * impulse.unsqueeze(0).unsqueeze(2)  # [batch, num_heads, head_dim, seq_len]
-            
-            # Кумулятивная сумма (интеграл)
-            cumulated = torch.cumsum(weighted_input, dim=-1)  # [batch, num_heads, head_dim, seq_len]
-            
-            # Применение затухания
-            output = cumulated * decay.unsqueeze(0).unsqueeze(2)  # [batch, num_heads, head_dim, seq_len]
-            
-            # Сборка обратно в [batch, seq_len, dim]
-            output = output.permute(0, 3, 1, 2)  # [batch, seq_len, num_heads, head_dim]
-            # hidden_states = weighted_output.reshape(batch, seq_len, dim)
-            output = output.sum(dim=2)
+            projected_values = self.value_projections[idx_layer](projected_states)
 
-            gate = torch.sigmoid(self.gate_proj[idx_layer](hidden_states))
-            hidden_states = output * gate + hidden_states * (1 - gate)
-            # =============== КОНЕЦ ИСПРАВЛЕННОЙ МОДИФИКАЦИИ ===============
-            
+            t = torch.arange(seq_len, device=hidden_states.device).float() / seq_len
+            output_states = torch.zeros_like(projected_states)
+
+            for h in range(self.num_heads):
+                coeff = self.layer_coeff[idx_layer][h]
+                exp_coeff = self.layer_exp_coeff[idx_layer][h]
+                exp_bias = self.layer_exp_bias[idx_layer][h]
+                w = self.rff_weights[idx_layer][h]  # [low_rank_dim]
+
+                # Generate random phase
+                phase = torch.rand(self.low_rank_dim, device=t.device) * 2 * math.pi
+                phi = torch.cos(t.unsqueeze(-1) * w.unsqueeze(0) * exp_coeff + phase.unsqueeze(0))
+                phi = phi / math.sqrt(self.low_rank_dim)  # [seq_len, low_rank_dim]
+
+                # φ_j * V_j
+                phi_v = phi.unsqueeze(0) * projected_values  # [batch, seq_len, low_rank_dim]
+
+                # Cumulative sum over time
+                cumsum_phi_v = torch.cumsum(phi_v, dim=1)  # [batch, seq_len, low_rank_dim]
+
+                # Compute output: φ_i^T @ (Σ_j≤i φ_j * V_j)
+                attention_output = phi.unsqueeze(0) * cumsum_phi_v  # [batch, seq_len, low_rank_dim]
+                attention_output = self.output_projections[idx_layer](attention_output)  # [batch, seq_len, d_model]
+                attention_output = coeff * torch.exp(exp_bias) * attention_output
+
+                output_states += attention_output
+
+            hidden_states = output_states
+
             hidden_states, residual = layer(
                 hidden_states, residual, inference_params=inference_params, **mixer_kwargs
             )
+
         if not self.fused_add_norm:
             residual = (hidden_states + residual) if residual is not None else hidden_states
             hidden_states = self.norm_f(residual.to(dtype=self.norm_f.weight.dtype))
         else:
-            # Set prenorm=False here since we don't need the residual
             hidden_states = layer_norm_fn(
                 hidden_states,
                 self.norm_f.weight,

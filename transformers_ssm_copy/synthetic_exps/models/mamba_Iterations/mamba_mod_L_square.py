@@ -185,21 +185,17 @@ class MixerModel(nn.Module):
         self.num_heads = 8
         self.disp = 10
         self.layer_exp_coeff = nn.ParameterList([
-            nn.Parameter(torch.ones(self.num_heads), requires_grad=True) for _ in range(n_layer)
+            nn.Parameter(torch.ones(self.num_heads) / self.disp) for _ in range(n_layer)
         ])
         self.layer_exp_bias = nn.ParameterList([
-            nn.Parameter(torch.zeros(self.num_heads), requires_grad=True) for _ in range(n_layer)
+            nn.Parameter(torch.zeros(self.num_heads)) for _ in range(n_layer)
         ])
         self.layer_coeff = nn.ParameterList([
-            nn.Parameter(torch.ones(self.num_heads), requires_grad=True) for _ in range(n_layer)
+            nn.Parameter(torch.ones(self.num_heads) / self.disp) for _ in range(n_layer)
         ])
 
         self.layer_input_projection = nn.ModuleList([
-            nn.Linear(d_model, d_model * self.num_heads, bias=True) for _ in range(n_layer)
-        ])
-
-        self.gate_proj = nn.ModuleList([
-            nn.Linear(d_model, d_model) for _ in range(n_layer)
+            nn.Linear(d_model, d_model, bias=True) for _ in range(n_layer)
         ])
         # End of additional parameters ...
 
@@ -215,48 +211,21 @@ class MixerModel(nn.Module):
         hidden_states = self.embedding(input_ids)
         residual = None
         for idx_layer, layer in enumerate(self.layers):
-            # =============== НАЧАЛО ИСПРАВЛЕННОЙ МОДИФИКАЦИИ ===============
+                                            # ............... Start of modification ...............
             batch, seq_len, dim = hidden_states.shape
             projected_states = self.layer_input_projection[idx_layer](hidden_states)
-            
-            # Проверка кратности размерности
-            head_dim = dim
-            # assert self.num_heads * head_dim == dim, f"d_model {dim} must be divisible by num_heads {self.num_heads}"
-            
-            # Реструктуризация в [batch, num_heads, head_dim, seq_len]
-            projected_states = projected_states.view(batch, seq_len, self.num_heads, head_dim)
-            projected_states = projected_states.permute(0, 2, 3, 1)  # [batch, num_heads, head_dim, seq_len]
-            
-            # Получение параметров
-            exp_coeff = self.layer_exp_coeff[idx_layer]  # [num_heads]
-            coeff = self.layer_coeff[idx_layer]          # [num_heads]
-            exp_bias = self.layer_exp_bias[idx_layer]    # [num_heads]
-            
-            # Нормализованные временные метки
-            t = torch.linspace(0, 1, seq_len, device=hidden_states.device)
-            
-            # Вычисление компонентов разложения
-            decay = torch.exp(-exp_coeff.unsqueeze(1) * t.unsqueeze(0))  # [num_heads, seq_len]
-            impulse = (coeff * torch.exp(exp_bias)).unsqueeze(1) * torch.exp(exp_coeff.unsqueeze(1) * t.unsqueeze(0))  # [num_heads, seq_len]
-            
-            # Применение импульса к входным данным
-            weighted_input = projected_states * impulse.unsqueeze(0).unsqueeze(2)  # [batch, num_heads, head_dim, seq_len]
-            
-            # Кумулятивная сумма (интеграл)
-            cumulated = torch.cumsum(weighted_input, dim=-1)  # [batch, num_heads, head_dim, seq_len]
-            
-            # Применение затухания
-            output = cumulated * decay.unsqueeze(0).unsqueeze(2)  # [batch, num_heads, head_dim, seq_len]
-            
-            # Сборка обратно в [batch, seq_len, dim]
-            output = output.permute(0, 3, 1, 2)  # [batch, seq_len, num_heads, head_dim]
-            # hidden_states = weighted_output.reshape(batch, seq_len, dim)
-            output = output.sum(dim=2)
-
-            gate = torch.sigmoid(self.gate_proj[idx_layer](hidden_states))
-            hidden_states = output * gate + hidden_states * (1 - gate)
-            # =============== КОНЕЦ ИСПРАВЛЕННОЙ МОДИФИКАЦИИ ===============
-            
+            # Compute u_s approximation: u_s ≈ α(t-s)
+            t = torch.arange(seq_len, device=hidden_states.device).float()
+            t_diff = (t.unsqueeze(1) - t.unsqueeze(0)).unsqueeze(0).repeat(batch, 1, 1) / seq_len
+            attention_weights = torch.zeros(batch, seq_len, seq_len, self.num_heads, device=hidden_states.device)
+            for h in range(self.num_heads):
+                attention_weights[..., h] = self.layer_coeff[idx_layer].weight[:seq_len,:seq_len] @ (torch.exp(-self.layer_exp_coeff[idx_layer].weight[:seq_len,:seq_len] @ (t_diff.abs()) + self.layer_exp_coeff[idx_layer].bias[:seq_len]))
+            attention_weights = torch.sum(attention_weights, dim=-1)  # Shape: [batch, seq_len, seq_len]
+            mask = torch.tril(torch.ones(seq_len, seq_len, device=hidden_states.device)).unsqueeze(0)
+            attention_weights = attention_weights * mask
+            # Apply mask before summing over heads
+            hidden_states = torch.bmm(attention_weights, projected_states)
+                                            # ............... End of modification ...............
             hidden_states, residual = layer(
                 hidden_states, residual, inference_params=inference_params, **mixer_kwargs
             )

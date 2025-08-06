@@ -182,16 +182,21 @@ class MixerModel(nn.Module):
         )
         
         # Additional parameters:
-        self.num_heads = 1
+        self.num_heads = 64
         self.disp = 10
-        self.layer_exp_coeff = [nn.Parameter(torch.ones(self.num_heads) / self.disp) for i in range(n_layer)]
-        self.layer_coeff = [nn.Parameter(torch.ones(self.num_heads) / self.disp) for i in range(n_layer)]
-        self.layer_input_projection = nn.ModuleList(
-            [
-                nn.Linear(d_model, d_model, bias=True) for i in range(n_layer)
-            ]
-        )
-        self.activations = [nn.GELU() for i in range(n_layer)]
+        self.layer_exp_coeff = nn.ParameterList([
+            nn.Parameter(torch.ones(self.num_heads) / self.disp) for _ in range(n_layer)
+        ])
+        self.layer_exp_bias = nn.ParameterList([
+            nn.Parameter(torch.zeros(self.num_heads)) for _ in range(n_layer)
+        ])
+        self.layer_coeff = nn.ParameterList([
+            nn.Parameter(torch.ones(self.num_heads) / self.disp) for _ in range(n_layer)
+        ])
+
+        self.layer_input_projection = nn.ModuleList([
+            nn.Linear(d_model, d_model, bias=True) for _ in range(n_layer)
+        ])
         # End of additional parameters ...
 
 
@@ -202,45 +207,51 @@ class MixerModel(nn.Module):
             for i, layer in enumerate(self.layers)
         }
     
-    def estimate_operator_norm(self, W, num_iterations=5):
-        # Power iteration to approximate the largest singular value
-        v = torch.randn(W.shape[1], device=W.device)
-        v = v / torch.norm(v)
-        for _ in range(num_iterations):
-            u = W @ v
-            v = W.T @ u
-            v = v / torch.norm(v)
-        singular_value = torch.abs(torch.dot(u, W @ v)) / torch.norm(u)
-        return singular_value
-    
-    def operator_norm_regularizer(self, W, Layer, epsilon=1e-8):
-        M = nn.functional.softplus(self.M_learnable[Layer])
-        norm = self.estimate_operator_norm(W)
-        scale = M / torch.clamp(norm, min=epsilon)
-        return W * scale
-
     def forward(self, input_ids, inference_params=None, **mixer_kwargs):
         hidden_states = self.embedding(input_ids)
         residual = None
         for idx_layer, layer in enumerate(self.layers):
-                                            # ............... Start of modification ...............
+            # =============== НАЧАЛО ИСПРАВЛЕННОЙ МОДИФИКАЦИИ ===============
             batch, seq_len, dim = hidden_states.shape
-            projected_states = nn.functional.linear(hidden_states, self.layer_input_projection[idx_layer].weight, self.layer_input_projection[idx_layer].bias)
-            # Compute u_s approximation: u_s ≈ α(t-s)
-            t = torch.arange(seq_len, device=hidden_states.device).float()
-            t_diff = (t.unsqueeze(1) - t.unsqueeze(0)).unsqueeze(0).repeat(batch, 1, 1)
-            attention_weights = torch.zeros_like(t_diff, device=t_diff.device)
-            for h in range(self.num_heads):
-                attention_weights += self.layer_coeff[idx_layer][h] * torch.exp(-self.layer_exp_coeff[idx_layer][h] * t_diff)
-            mask = torch.tril(torch.ones(seq_len, seq_len, device=hidden_states.device)).unsqueeze(0)
-            attention_weights = attention_weights * mask
-            attention_weights = nn.functional.softmax(attention_weights, dim=-1)
-            hidden_states = torch.bmm(attention_weights, projected_states)
-                                            # ............... End of modification ...............
+            projected_states = self.layer_input_projection[idx_layer](hidden_states)
+            
+            # Проверка кратности размерности
+            head_dim = dim // self.num_heads
+            assert self.num_heads * head_dim == dim, f"d_model {dim} must be divisible by num_heads {self.num_heads}"
+            
+            # Реструктуризация в [batch, num_heads, head_dim, seq_len]
+            projected_states = projected_states.view(batch, seq_len, self.num_heads, head_dim)
+            projected_states = projected_states.permute(0, 2, 3, 1)  # [batch, num_heads, head_dim, seq_len]
+            
+            # Получение параметров
+            exp_coeff = self.layer_exp_coeff[idx_layer]  # [num_heads]
+            coeff = self.layer_coeff[idx_layer]          # [num_heads]
+            exp_bias = self.layer_exp_bias[idx_layer]    # [num_heads]
+            
+            # Нормализованные временные метки
+            t = torch.linspace(0, 1, seq_len, device=hidden_states.device)
+            
+            # Вычисление компонентов разложения
+            decay = torch.exp(-exp_coeff.unsqueeze(1) * t.unsqueeze(0))  # [num_heads, seq_len]
+            impulse = (coeff * torch.exp(exp_bias)).unsqueeze(1) * torch.exp(exp_coeff.unsqueeze(1) * t.unsqueeze(0))  # [num_heads, seq_len]
+            
+            # Применение импульса к входным данным
+            weighted_input = projected_states * impulse.unsqueeze(0).unsqueeze(2)  # [batch, num_heads, head_dim, seq_len]
+            
+            # Кумулятивная сумма (интеграл)
+            cumulated = torch.cumsum(weighted_input, dim=-1)  # [batch, num_heads, head_dim, seq_len]
+            
+            # Применение затухания
+            weighted_output = cumulated * decay.unsqueeze(0).unsqueeze(2)  # [batch, num_heads, head_dim, seq_len]
+            
+            # Сборка обратно в [batch, seq_len, dim]
+            weighted_output = weighted_output.permute(0, 3, 1, 2)  # [batch, seq_len, num_heads, head_dim]
+            hidden_states = weighted_output.reshape(batch, seq_len, dim)
+            # =============== КОНЕЦ ИСПРАВЛЕННОЙ МОДИФИКАЦИИ ===============
+            
             hidden_states, residual = layer(
                 hidden_states, residual, inference_params=inference_params, **mixer_kwargs
             )
-            hidden_states = self.activations[idx_layer](hidden_states)
         if not self.fused_add_norm:
             residual = (hidden_states + residual) if residual is not None else hidden_states
             hidden_states = self.norm_f(residual.to(dtype=self.norm_f.weight.dtype))

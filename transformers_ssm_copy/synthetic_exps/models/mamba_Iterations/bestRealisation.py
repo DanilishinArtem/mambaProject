@@ -197,10 +197,6 @@ class MixerModel(nn.Module):
         self.layer_input_projection = nn.ModuleList([
             nn.Linear(d_model, d_model * self.num_heads, bias=True) for _ in range(n_layer)
         ])
-
-        self.gate_proj = nn.ModuleList([
-            nn.Linear(d_model, d_model) for _ in range(n_layer)
-        ])
         # End of additional parameters ...
 
 
@@ -246,15 +242,12 @@ class MixerModel(nn.Module):
             cumulated = torch.cumsum(weighted_input, dim=-1)  # [batch, num_heads, head_dim, seq_len]
             
             # Применение затухания
-            output = cumulated * decay.unsqueeze(0).unsqueeze(2)  # [batch, num_heads, head_dim, seq_len]
+            weighted_output = cumulated * decay.unsqueeze(0).unsqueeze(2)  # [batch, num_heads, head_dim, seq_len]
             
             # Сборка обратно в [batch, seq_len, dim]
-            output = output.permute(0, 3, 1, 2)  # [batch, seq_len, num_heads, head_dim]
+            weighted_output = weighted_output.permute(0, 3, 1, 2)  # [batch, seq_len, num_heads, head_dim]
             # hidden_states = weighted_output.reshape(batch, seq_len, dim)
-            output = output.sum(dim=2)
-
-            gate = torch.sigmoid(self.gate_proj[idx_layer](hidden_states))
-            hidden_states = output * gate + hidden_states * (1 - gate)
+            hidden_states = weighted_output.sum(dim=2)
             # =============== КОНЕЦ ИСПРАВЛЕННОЙ МОДИФИКАЦИИ ===============
             
             hidden_states, residual = layer(
