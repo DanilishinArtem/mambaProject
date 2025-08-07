@@ -23,7 +23,7 @@ def train_model(model, dataloader, writer, tag, epochs=1):
             optimizer.zero_grad()
             logits = model(input_ids)                               # (B, L, V)
 
-            loss = loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
+            loss = loss_fn(logits['logits'].view(-1, logits['logits'].size(-1)), labels.view(-1))
             loss.backward()
             optimizer.step()
 

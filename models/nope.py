@@ -184,10 +184,10 @@ class GPTNoPEAttention(nn.Module):
             # Apply the attention mask
             attn_scores = attn_scores + attention_mask
 
-        # part of saving attention score TODO
+        # # part of saving attention score TODO
         # self.counter += 1
         # if self.counter == 5000:
-        #     path = "/home/adanilishin/mambaProject/tensors/nope_copy.pt"
+        #     path = "/home/adanilishin/mambaProject/tensors/nope_text.pt"
         #     if not os.path.exists(path):
         #         torch.save(attn_scores, path)
         #         print("[INFO] Tensor saved at: {}".format(path))

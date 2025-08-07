@@ -116,28 +116,6 @@ def _init_weights(
 
 
 import torch.nn.functional as F
-
-class LinearAttention(nn.Module):
-    def __init__(self, dim, proj_dim=None):
-        super().__init__()
-        self.dim = dim
-        self.to_qkv = nn.Linear(dim, dim * 3, bias=False)
-        self.proj_dim = proj_dim or dim
-        self.register_buffer('proj', torch.randn(dim, self.proj_dim))
-
-    def forward(self, x):
-        qkv = self.to_qkv(x)           # (B, N, 3D)
-        q, k, v = qkv.chunk(3, dim=-1) # each (B, N, D)
-        qf = F.elu(q @ self.proj) + 1
-        kf = F.elu(k @ self.proj) + 1
-        KV = torch.bmm(kf.transpose(1, 2), v)  # (B, P, D)
-        kf_sum = kf.sum(dim=1)  # (B, P)
-        num = torch.bmm(qf, KV)  # (B, N, D) TODO: Попробовать вернуть num (аля ядро)
-        return num
-        den = (qf * kf_sum.unsqueeze(1)).sum(dim=-1, keepdim=True).clamp(min=1e-6)
-        out = num / den  # (B, N, D)
-        return out
-    
 class CausalLinearCombination(nn.Module):
     def __init__(self, dim, k):
         super().__init__()
@@ -151,6 +129,7 @@ class CausalLinearCombination(nn.Module):
         return y.transpose(1, 2)
     
 
+import os
 class MixerModel(nn.Module):
     def __init__(
         self,
@@ -219,18 +198,23 @@ class MixerModel(nn.Module):
         
         # Additional parameters:
         self.approx_dim = 16
-        self.proj = 219
-        self.lin_projections_in = nn.ModuleList([
-            nn.Linear(d_model, self.proj) for _ in range(n_layer)
-        ])
-        self.lin_projections_out = nn.ModuleList([
-            nn.Linear(self.proj, d_model) for _ in range(n_layer)
-        ])
+
         self.layer_filter_params = nn.ModuleList([
-            CausalLinearCombination(dim=self.proj, k=self.approx_dim) for _ in range(n_layer)
+            CausalLinearCombination(dim=d_model, k=self.approx_dim) for _ in range(n_layer)
         ])
-        self.attn_layers = nn.ModuleList([LinearAttention(d_model) for _ in range(n_layer)])
+
+        self.counter = 0
         # End of additional parameters ...
+
+    def batch_covariance(self, x: torch.Tensor) -> torch.Tensor:
+        x_centered = x - x.mean(dim=-1, keepdim=True)
+        cov = torch.matmul(x_centered, x_centered.transpose(-1, -2))
+        cov = cov / (x.shape[-1] - 1)
+        # part of saving attention score TODO
+        path = "/home/adanilishin/mambaProject/tensors/mamba_copy.pt"
+        if not os.path.exists(path):
+            torch.save(cov, path)
+            print("[INFO] Tensor saved at: {}".format(path))
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
         return {
@@ -241,15 +225,15 @@ class MixerModel(nn.Module):
     def forward(self, input_ids, inference_params=None, **mixer_kwargs):
         hidden_states = self.embedding(input_ids)
         residual = None
+        self.counter += 1
         for idx_layer, layer in enumerate(self.layers):
             # =============== НАЧАЛО ИСПРАВЛЕННОЙ МОДИФИКАЦИИ ===============
-            hidden_states = self.attn_layers[idx_layer](hidden_states)  # Add attention
-            hidden_states = self.lin_projections_in[idx_layer](hidden_states)
-            hidden_states = self.layer_filter_params[idx_layer](hidden_states)
-            hidden_states = self.lin_projections_out[idx_layer](hidden_states)
             hidden_states, residual = layer(
                 hidden_states, residual, inference_params=inference_params, **mixer_kwargs
             )
+            # hidden_states = self.layer_filter_params[idx_layer](hidden_states)
+            if self.counter == 5000:
+                self.batch_covariance(hidden_states)
 
         if not self.fused_add_norm:
             residual = (hidden_states + residual) if residual is not None else hidden_states

@@ -53,11 +53,12 @@ def build_mpt_alibi_tensor(num_heads, sequence_length, alibi_bias_max=8, device=
     return alibi.squeeze(0)
 
 
-
+import os
 
 class GPTAlibiAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
+        self.counter = 0
         self.config = config
         self.num_attention_heads = config.num_attention_heads
         self.hidden_size = config.hidden_size
@@ -237,6 +238,14 @@ class GPTAlibiAttention(nn.Module):
         if attention_mask is not None:
             # Apply the attention mask
             attn_scores = attn_scores + attention_mask
+
+        # # part of saving attention score TODO
+        # self.counter += 1
+        # if self.counter == 5000:
+        #     path = "/home/adanilishin/mambaProject/tensors/alibi_copy.pt"
+        #     if not os.path.exists(path):
+        #         torch.save(attn_scores, path)
+        #         print("[INFO] Tensor saved at: {}".format(path))
 
         attn_weights = nn.functional.softmax(attn_scores, dim=-1)
         attn_weights = attn_weights.to(value.dtype)

@@ -129,6 +129,7 @@ class CausalLinearCombination(nn.Module):
         return y.transpose(1, 2)
     
 
+import os
 class MixerModel(nn.Module):
     def __init__(
         self,
@@ -202,8 +203,6 @@ class MixerModel(nn.Module):
             CausalLinearCombination(dim=d_model, k=self.approx_dim) for _ in range(n_layer)
         ])
         # End of additional parameters ...
-
-
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
         return {

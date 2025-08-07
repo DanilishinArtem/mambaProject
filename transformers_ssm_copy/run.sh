@@ -26,4 +26,8 @@
 
 
 # python3 synthetic_exps/main.py --train_batch_size 2 --state_dim 16 --context_len 220 --model "mamba" --train_task "copy" --eval_task  "copy" --min_train_len 5 --max_train_len 100 --min_eval_len 5 --max_eval_len 100 --steps 10000 --heads 1  --epochs 1 --layers 12
+
+
+
+rm -rf /home/adanilishin/mambaProject/transformers_ssm_copy/tensorboard/model_mambapp*
 python3 synthetic_exps/main.py --train_batch_size 2 --state_dim 16 --context_len 220 --model "mambapp" --train_task "copy" --eval_task  "copy" --min_train_len 5 --max_train_len 100 --min_eval_len 5 --max_eval_len 100 --steps 10000 --heads 1  --epochs 1 --layers 12

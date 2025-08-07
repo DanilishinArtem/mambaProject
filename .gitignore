@@ -4,7 +4,7 @@ __pycache__
 /checkpoints/
 /tensorboard/
 /mamba/
-/transformers_ssm_copy/tensorboard/
+# /transformers_ssm_copy/tensorboard/
 
 /transformer-xl/data/
 /transformer-xl/one-billion-words/

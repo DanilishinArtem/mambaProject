@@ -58,20 +58,15 @@ def create_transformer_model():
                 vocab_size=vocab_size,
                 max_position_embeddings=1024,
                 )
-    transformer = GPTNeoXAlibiForCausalLM(config)
+    
+    # transformer = GPTNeoXAlibiForCausalLM(config)
+    # transformer = transformer.to(Config.device)
+    # return transformer
+
+    from models.nope import  GPTNeoXNoPEForCausalLM
+    transformer = GPTNeoXNoPEForCausalLM(config)
     transformer = transformer.to(Config.device)
     return transformer
-
-    # vocab_size = len(Config.tokenizer)
-    # print("[INFO] vocab_size = {}".format(vocab_size))
-    # transformer = Transformer(
-    #     vocab_size,
-    #     Config.embed_dim,
-    #     nhead=Config.heads,
-    #     num_layers=Config.num_layers,
-    #     max_seq_len=Config.max_length,
-    # ).to(Config.device)
-    # return transformer
 
 
 def train_process(train_loader, tag, num_epochs):
