@@ -132,8 +132,7 @@ class LinearAttention(nn.Module):
         kf = F.elu(k @ self.proj) + 1
         KV = torch.bmm(kf.transpose(1, 2), v)  # (B, P, D)
         kf_sum = kf.sum(dim=1)  # (B, P)
-        num = torch.bmm(qf, KV)  # (B, N, D) TODO: Попробовать вернуть num (аля ядро)
-        return num
+        num = torch.bmm(qf, KV)  # (B, N, D)
         den = (qf * kf_sum.unsqueeze(1)).sum(dim=-1, keepdim=True).clamp(min=1e-6)
         out = num / den  # (B, N, D)
         return out
@@ -219,15 +218,8 @@ class MixerModel(nn.Module):
         
         # Additional parameters:
         self.approx_dim = 16
-        self.proj = 219
-        self.lin_projections_in = nn.ModuleList([
-            nn.Linear(d_model, self.proj) for _ in range(n_layer)
-        ])
-        self.lin_projections_out = nn.ModuleList([
-            nn.Linear(self.proj, d_model) for _ in range(n_layer)
-        ])
         self.layer_filter_params = nn.ModuleList([
-            CausalLinearCombination(dim=self.proj, k=self.approx_dim) for _ in range(n_layer)
+            CausalLinearCombination(dim=d_model, k=self.approx_dim) for _ in range(n_layer)
         ])
         self.attn_layers = nn.ModuleList([LinearAttention(d_model) for _ in range(n_layer)])
         # End of additional parameters ...
@@ -244,9 +236,7 @@ class MixerModel(nn.Module):
         for idx_layer, layer in enumerate(self.layers):
             # =============== НАЧАЛО ИСПРАВЛЕННОЙ МОДИФИКАЦИИ ===============
             hidden_states = self.attn_layers[idx_layer](hidden_states)  # Add attention
-            hidden_states = self.lin_projections_in[idx_layer](hidden_states)
             hidden_states = self.layer_filter_params[idx_layer](hidden_states)
-            hidden_states = self.lin_projections_out[idx_layer](hidden_states)
             hidden_states, residual = layer(
                 hidden_states, residual, inference_params=inference_params, **mixer_kwargs
             )
