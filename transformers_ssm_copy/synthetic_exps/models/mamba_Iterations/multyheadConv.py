@@ -25,6 +25,85 @@ try:
 except ImportError:
     RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
 
+def init_(tensor):
+    dim = tensor.shape[-1]
+    std = 1 / math.sqrt(dim)
+    tensor.uniform_(-std, std)
+    return tensor
+
+def default(val, default_val):
+    return val if val is not None else default_val
+
+class LinformerSelfAttention(nn.Module):
+    def __init__(
+        self, dim, seq_len, k=256, heads=8, dim_head=None,
+        one_kv_head=False, share_kv=False, dropout=0.0
+    ):
+        super().__init__()
+        assert dim % heads == 0, 'dimension must be divisible by heads'
+
+        self.seq_len = seq_len
+        self.k = k
+        self.heads = heads
+        self.dim_head = dim_head or (dim // heads)
+        self.share_kv = share_kv
+
+        # Проекции
+        self.to_q = nn.Linear(dim, self.dim_head * heads, bias=False)
+
+        kv_dim = self.dim_head if one_kv_head else (self.dim_head * heads)
+        self.to_k = nn.Linear(dim, kv_dim, bias=False)
+        self.proj_k = nn.Parameter(torch.empty(seq_len, k).uniform_(-0.02, 0.02))
+
+        if not share_kv:
+            self.to_v = nn.Linear(dim, kv_dim, bias=False)
+            self.proj_v = nn.Parameter(torch.empty(seq_len, k).uniform_(-0.02, 0.02))
+
+        self.dropout = nn.Dropout(dropout)
+        self.to_out = nn.Linear(self.dim_head * heads, dim)
+
+        # --- Каузальная маска для проецированной длины ---
+        # seq_len × k → после проекции токен t видит только прошлое и себя
+        proj_mask = torch.ones(seq_len, k, dtype=torch.bool)
+        for i in range(seq_len):
+            allowed_k = min(k, i + 1)  # сколько позиций в проекции можно видеть
+            proj_mask[i, allowed_k:] = False
+        self.register_buffer("causal_proj_mask", proj_mask, persistent=False)
+
+    def forward(self, x, context=None):
+        b, n, _ = x.shape
+        h, d_h, k = self.heads, self.dim_head, self.k
+
+        kv_input = x if context is None else context
+        kv_len = kv_input.shape[1]
+
+        # --- Q, K, V ---
+        q = self.to_q(x).reshape(b, n, h, d_h).transpose(1, 2)  # b,h,n,d_h
+        k_lin = self.to_k(kv_input)
+        v_lin = k_lin if self.share_kv else self.to_v(kv_input)
+
+        proj_k = self.proj_k[:kv_len]  # подрезаем при коротких последовательностях
+        k_proj = torch.einsum('bnd,nk->bkd', k_lin, proj_k)  # b,k,d_kv
+        v_proj = torch.einsum('bnd,nk->bkd', v_lin, proj_k if self.share_kv else self.proj_v[:kv_len])
+
+        # --- Разбиваем на головы ---
+        k_proj = k_proj.reshape(b, k, h, d_h).transpose(1, 2)  # b,h,k,d_h
+        v_proj = v_proj.reshape(b, k, h, d_h).transpose(1, 2)  # b,h,k,d_h
+
+        # --- Attention ---
+        dots = torch.einsum('bhnd,bhkd->bhnk', q, k_proj) * (d_h ** -0.5)
+
+        # Каузальная маска в проекции
+        causal_mask = self.causal_proj_mask[:n, :k]
+        dots = dots.masked_fill(~causal_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+
+        attn = F.softmax(dots, dim=-1)
+        attn = self.dropout(attn)
+
+        out = torch.einsum('bhnk,bhkd->bhnd', attn, v_proj)
+        out = out.transpose(1, 2).reshape(b, n, -1)
+        return self.to_out(out)
+
 
 def create_block(
     d_model,
@@ -115,42 +194,40 @@ def _init_weights(
                     p /= math.sqrt(n_residuals_per_layer * n_layer)
 
 
+import torch.nn.functional as F
+class CausalLinearCombinationLocal(nn.Module):
+    def __init__(self, dim, k):
+        super().__init__()
+        self.k = k
+        self.dim = dim
+        self.conv = nn.Conv1d(dim, dim, kernel_size=k, bias=False)
+    def forward(self, x):
+        x = x.transpose(1, 2)
+        x = F.pad(x, (self.k - 1, 0))
+        y = self.conv(x)
+        return y.transpose(1, 2)    
+
+import os
 class MixerModel(nn.Module):
-    def __init__(
-        self,
-        d_model: int,
-        n_layer: int,
-        d_intermediate: int,
-        vocab_size: int,
-        ssm_cfg=None,
-        attn_layer_idx=None,
-        attn_cfg=None,
-        norm_epsilon: float = 1e-5,
-        rms_norm: bool = False,
-        initializer_cfg=None,
-        fused_add_norm=False,
-        residual_in_fp32=False,
-        device=None,
-        dtype=None,
-    ) -> None:
+    def __init__(self, d_model: int, n_layer: int, d_intermediate: int, vocab_size: int,
+                 heads: int = 8,
+                 ssm_cfg=None, attn_layer_idx=None, attn_cfg=None,
+                 norm_epsilon: float = 1e-5, rms_norm: bool = False,
+                 initializer_cfg=None, fused_add_norm=False,
+                 residual_in_fp32=False, device=None, dtype=None) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
+
         self.residual_in_fp32 = residual_in_fp32
+        self.fused_add_norm = fused_add_norm
+        self.n_layer = n_layer
+        self.heads = heads
 
         self.embedding = nn.Embedding(vocab_size, d_model, **factory_kwargs)
 
-        # We change the order of residual and layer norm:
-        # Instead of LN -> Attn / MLP -> Add, we do:
-        # Add -> LN -> Attn / MLP / Mixer, returning both the residual branch (output of Add) and
-        # the main branch (output of MLP / Mixer). The model definition is unchanged.
-        # This is for performance reason: we can fuse add + layer_norm.
-        self.fused_add_norm = fused_add_norm
-        if self.fused_add_norm:
-            if layer_norm_fn is None or rms_norm_fn is None:
-                raise ImportError("Failed to import Triton LayerNorm / RMSNorm kernels")
-
-        self.layers = nn.ModuleList(
-            [
+        # Слои: [n_layer][n_heads]
+        self.layers = nn.ModuleList([
+            nn.ModuleList([
                 create_block(
                     d_model,
                     d_intermediate=d_intermediate,
@@ -161,114 +238,108 @@ class MixerModel(nn.Module):
                     rms_norm=rms_norm,
                     residual_in_fp32=residual_in_fp32,
                     fused_add_norm=fused_add_norm,
-                    layer_idx=i,
                     **factory_kwargs,
-                )
-                for i in range(n_layer)
-            ]
-        )
+                ) for _ in range(self.heads)
+            ]) for _ in range(self.n_layer)
+        ])
 
+        # Кауза́льные фильтры [n_layer][n_heads]
+        self.layer_filter = nn.ModuleList([
+            nn.ModuleList([
+                CausalLinearCombinationLocal(dim=d_model, k=16) for _ in range(self.heads)
+            ]) for _ in range(self.n_layer)
+        ])
+
+        # Веса для агрегации голов внутри каждого слоя
+        self.weights = nn.ParameterList([
+            nn.Parameter(torch.zeros(self.heads)) for _ in range(self.n_layer)
+        ])
+
+        # Финальная нормализация
         self.norm_f = (nn.LayerNorm if not rms_norm else RMSNorm)(
             d_model, eps=norm_epsilon, **factory_kwargs
         )
 
+        # Инициализация весов
         self.apply(
             partial(
                 _init_weights,
                 n_layer=n_layer,
                 **(initializer_cfg if initializer_cfg is not None else {}),
-                n_residuals_per_layer=1 if d_intermediate == 0 else 2,  # 2 if we have MLP
+                n_residuals_per_layer=1 if d_intermediate == 0 else 2,
             )
         )
-        
-        # Additional parameters:
-        self.num_heads = 64
-        self.disp = 10
-        self.layer_exp_coeff = nn.ParameterList([
-            nn.Parameter(torch.ones(self.num_heads) / self.disp) for _ in range(n_layer)
-        ])
-        self.layer_exp_bias = nn.ParameterList([
-            nn.Parameter(torch.zeros(self.num_heads)) for _ in range(n_layer)
-        ])
-        self.layer_coeff = nn.ParameterList([
-            nn.Parameter(torch.ones(self.num_heads) / self.disp) for _ in range(n_layer)
-        ])
 
-        self.layer_input_projection = nn.ModuleList([
-            nn.Linear(d_model, d_model, bias=True) for _ in range(n_layer)
-        ])
-        # End of additional parameters ...
+        self.counter = 0
 
+    def batch_covariance(self, x: torch.Tensor, by_time: bool = True) -> torch.Tensor:
+        """
+        Вычисляет ковариацию.
+        Если by_time=True → ковариация между временными шагами.
+        Если False → ковариация между признаками.
+        """
+        if by_time:
+            # Считаем ковариацию по оси seq_len
+            # x: [batch, seq_len, dim] → [batch, dim, seq_len]
+            x = x.transpose(1, 2)
+        # Центрируем
+        x_centered = x - x.mean(dim=-1, keepdim=True)
+        cov = torch.matmul(x_centered, x_centered.transpose(-1, -2))
+        cov = cov / (x.shape[-1] - 1)
 
+        path = "/home/adanilishin/mambaProject/tensors/mamba_copy.pt"
+        if not os.path.exists(path):
+            torch.save(cov, path)
+            print(f"[INFO] Covariance tensor saved at: {path}")
+        return cov
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
         return {
-            i: layer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
+            i: [head.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
+                for head in layer]
             for i, layer in enumerate(self.layers)
         }
-    
+
     def forward(self, input_ids, inference_params=None, **mixer_kwargs):
-        hidden_states = self.embedding(input_ids)
+        hidden_states = self.embedding(input_ids)  # [batch, seq_len, dim]
         residual = None
-        for idx_layer, layer in enumerate(self.layers):
-            # =============== НАЧАЛО ИСПРАВЛЕННОЙ МОДИФИКАЦИИ ===============
-            batch, seq_len, dim = hidden_states.shape
-            projected_states = self.layer_input_projection[idx_layer](hidden_states)
-            
-            # Проверка кратности размерности
-            head_dim = dim // self.num_heads
-            assert self.num_heads * head_dim == dim, f"d_model {dim} must be divisible by num_heads {self.num_heads}"
-            
-            # Реструктуризация в [batch, num_heads, head_dim, seq_len]
-            projected_states = projected_states.view(batch, seq_len, self.num_heads, head_dim)
-            projected_states = projected_states.permute(0, 2, 3, 1)  # [batch, num_heads, head_dim, seq_len]
-            
-            # Получение параметров
-            exp_coeff = self.layer_exp_coeff[idx_layer]  # [num_heads]
-            coeff = self.layer_coeff[idx_layer]          # [num_heads]
-            exp_bias = self.layer_exp_bias[idx_layer]    # [num_heads]
-            
-            # Нормализованные временные метки
-            t = torch.linspace(0, 1, seq_len, device=hidden_states.device)
-            
-            # Вычисление компонентов разложения
-            decay = torch.exp(-exp_coeff.unsqueeze(1) * t.unsqueeze(0))  # [num_heads, seq_len]
-            impulse = (coeff * torch.exp(exp_bias)).unsqueeze(1) * torch.exp(exp_coeff.unsqueeze(1) * t.unsqueeze(0))  # [num_heads, seq_len]
-            
-            # Применение импульса к входным данным
-            weighted_input = projected_states * impulse.unsqueeze(0).unsqueeze(2)  # [batch, num_heads, head_dim, seq_len]
-            
-            # Кумулятивная сумма (интеграл)
-            cumulated = torch.cumsum(weighted_input, dim=-1)  # [batch, num_heads, head_dim, seq_len]
-            
-            # Применение затухания
-            weighted_output = cumulated * decay.unsqueeze(0).unsqueeze(2)  # [batch, num_heads, head_dim, seq_len]
-            
-            # Сборка обратно в [batch, seq_len, dim]
-            weighted_output = weighted_output.permute(0, 3, 1, 2)  # [batch, seq_len, num_heads, head_dim]
-            hidden_states = weighted_output.reshape(batch, seq_len, dim)
-            # =============== КОНЕЦ ИСПРАВЛЕННОЙ МОДИФИКАЦИИ ===============
-            
-            hidden_states, residual = layer(
-                hidden_states, residual, inference_params=inference_params, **mixer_kwargs
-            )
+        self.counter += 1
+
+        for idx_layer in range(self.n_layer):
+            w = torch.softmax(self.weights[idx_layer], dim=0)  # [n_heads]
+            total_heads_hidden_states = torch.zeros_like(hidden_states)
+
+            for idx_head in range(self.heads):
+                head_input = self.layer_filter[idx_layer][idx_head](hidden_states)
+                head_output, _ = self.layers[idx_layer][idx_head](
+                    head_input, None, inference_params=inference_params, **mixer_kwargs
+                )
+                total_heads_hidden_states += head_output * w[idx_head]
+
+            # Residual connection (один раз после агрегации всех голов)
+            residual = (total_heads_hidden_states + hidden_states) if residual is None else (total_heads_hidden_states + residual)
+            hidden_states = residual
+
+        # Считаем ковариацию в определённые моменты
+        if self.counter in (2000, 5000):
+            self.batch_covariance(hidden_states, by_time=True)
+
+        # Финальная нормализация
         if not self.fused_add_norm:
-            residual = (hidden_states + residual) if residual is not None else hidden_states
-            hidden_states = self.norm_f(residual.to(dtype=self.norm_f.weight.dtype))
+            hidden_states = self.norm_f(hidden_states.to(dtype=self.norm_f.weight.dtype))
         else:
-            # Set prenorm=False here since we don't need the residual
             hidden_states = layer_norm_fn(
                 hidden_states,
                 self.norm_f.weight,
                 self.norm_f.bias,
                 eps=self.norm_f.eps,
-                residual=residual,
+                residual=None,
                 prenorm=False,
                 residual_in_fp32=self.residual_in_fp32,
                 is_rms_norm=isinstance(self.norm_f, RMSNorm)
             )
-        return hidden_states
 
+        return hidden_states
 
 class MambaPlusPlusML(nn.Module, GenerationMixin):
 

@@ -154,11 +154,6 @@ class MixerModel(nn.Module):
 
         self.embedding = nn.Embedding(vocab_size, d_model, **factory_kwargs)
 
-        # We change the order of residual and layer norm:
-        # Instead of LN -> Attn / MLP -> Add, we do:
-        # Add -> LN -> Attn / MLP / Mixer, returning both the residual branch (output of Add) and
-        # the main branch (output of MLP / Mixer). The model definition is unchanged.
-        # This is for performance reason: we can fuse add + layer_norm.
         self.fused_add_norm = fused_add_norm
         if self.fused_add_norm:
             if layer_norm_fn is None or rms_norm_fn is None:
@@ -192,54 +187,163 @@ class MixerModel(nn.Module):
                 _init_weights,
                 n_layer=n_layer,
                 **(initializer_cfg if initializer_cfg is not None else {}),
-                n_residuals_per_layer=1 if d_intermediate == 0 else 2,  # 2 if we have MLP
+                n_residuals_per_layer=1 if d_intermediate == 0 else 2,
             )
         )
-        
+
         # Additional parameters:
         self.approx_dim = 16
+        # Keep the conv-based filter as optional helper (you can still use it)
+        self.layer_filter_params = nn.ModuleList(
+            [CausalLinearCombination(dim=d_model, k=self.approx_dim) for _ in range(n_layer)]
+        )
 
-        self.layer_filter_params = nn.ModuleList([
-            CausalLinearCombination(dim=d_model, k=self.approx_dim) for _ in range(n_layer)
-        ])
+        self.g_parameter = nn.ParameterList([nn.Parameter(torch.tensor(0.05), requires_grad=True) for _ in range(n_layer)])
 
         self.counter = 0
-        # End of additional parameters ...
-
-    def batch_covariance(self, x: torch.Tensor) -> torch.Tensor:
-        x_centered = x - x.mean(dim=-1, keepdim=True)
-        cov = torch.matmul(x_centered, x_centered.transpose(-1, -2))
-        cov = cov / (x.shape[-1] - 1)
-        # part of saving attention score TODO
-        path = "/home/adanilishin/mambaProject/tensors/mamba_copy.pt"
-        if not os.path.exists(path):
-            torch.save(cov, path)
-            print("[INFO] Tensor saved at: {}".format(path))
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
         return {
             i: layer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
             for i, layer in enumerate(self.layers)
         }
+
+    def batch_covariance(self, x: torch.Tensor, by_time: bool = True) -> torch.Tensor:
+        """
+        Вычисляет ковариацию.
+        Если by_time=True → ковариация между временными шагами.
+        Если False → ковариация между признаками.
+        """
+        if by_time:
+            # Считаем ковариацию по оси seq_len
+            # x: [batch, seq_len, dim] → [batch, dim, seq_len]
+            x = x.transpose(1, 2)
+        # Центрируем
+        x_centered = x - x.mean(dim=-1, keepdim=True)
+        cov = torch.matmul(x_centered, x_centered.transpose(-1, -2))
+        cov = cov / (x.shape[-1] - 1)
+
+        path = "/home/adanilishin/mambaProject/tensors/mamba_copy.pt"
+        if not os.path.exists(path):
+            torch.save(cov, path)
+            print(f"[INFO] Covariance tensor saved at: {path}")
+        return cov
     
-    def forward(self, input_ids, inference_params=None, **mixer_kwargs):
-        hidden_states = self.embedding(input_ids)
+    @staticmethod
+    def _compute_token_mask_topk_from_dt(layer_mixer, hidden_states, keep_ratio=0.8):
+        """
+        Для данного слоя (mixer: Mamba2) и скрытых состояний (B,L,D_model)
+        возвращаем mask формы (B,L,nheads) (bool), где для каждой пары (batch,head)
+        сохраняем top-k позиций по dt_sp = softplus(dt + dt_bias).
+        keep_ratio in (0,1] — доля токенов, которые оставляем (напр. 0.2).
+        """
+        # compute projection to extract dt slice
+        with torch.no_grad():
+            zxbcdt = layer_mixer.in_proj(hidden_states)  # (B, L, d_in_proj)
+        # split last dim: last piece length == nheads
+        nheads = layer_mixer.nheads
+        # indices assuming same split as in Mamba2
+        last = zxbcdt.shape[-1]
+        # get dt slice: it's last nheads entries
+        dt = zxbcdt[..., -nheads:]  # (B,L,nheads)  (pre-softplus)
+        # compute dt_sp
+        # layer_mixer.dt_bias shape (nheads,)
+        dt_sp = F.softplus(dt + layer_mixer.dt_bias.view(1, 1, -1).to(dt.device))
+        B, L, H = dt_sp.shape
+        assert H == nheads
+        k = max(1, int(L * float(keep_ratio)))
+        # permute to (B, H, L) to topk per head
+        dt_perm = dt_sp.permute(0, 2, 1)  # (B, H, L)
+        # if k >= L, everything kept
+        if k >= L:
+            return torch.ones(B, L, H, dtype=torch.bool, device=dt_sp.device)
+        values, indices = torch.topk(dt_perm, k=k, dim=-1)  # (B, H, k)
+        # build mask (B, H, L)
+        mask_bhl = torch.zeros(B, H, L, dtype=torch.bool, device=dt_sp.device)
+        # scatter True at indices
+        mask_bhl.scatter_(2, indices, True)
+        # transpose back to (B,L,H)
+        mask_blh = mask_bhl.permute(0, 2, 1)
+        return mask_blh
+
+    @staticmethod
+    def _compute_token_mask_threshold_from_dt(layer_mixer, hidden_states, g=0.1):
+        """
+        Для данного слоя (mixer: Mamba2) и скрытых состояний (B,L,D_model)
+        возвращаем mask формы (B,L,nheads) (bool), где для каждой пары (batch,head)
+        сохраняем токены, у которых dt_sp = softplus(dt + dt_bias) >= g.
+
+        Порог g задаётся численно (например, 0.1).
+        """
+        # with torch.no_grad():
+        zxbcdt = layer_mixer.in_proj(hidden_states)  # (B, L, d_in_proj)
+
+        nheads = layer_mixer.nheads
+        dt = zxbcdt[..., -nheads:]  # (B,L,nheads), pre-softplus
+
+        dt_sp = torch.nn.functional.softplus(dt + layer_mixer.dt_bias.view(1, 1, -1).to(dt.device))  # (B,L,nheads)
+        
+        
+        # mask = torch.sigmoid((dt_sp - torch.sigmoid(g)) * 10)
+        # # Создаём маску: True, где dt_sp >= g
+        mask = dt_sp >= g  # (B,L,nheads), bool tensor
+
+        return mask
+
+    def forward(
+        self,
+        input_ids,
+        inference_params=None,
+        use_token_filter: bool = True,
+        keep_ratio: float = 0.8,
+        use_conv_filter: bool = False,
+        **mixer_kwargs,
+    ):
+        """
+        use_token_filter: if True, apply per-layer per-head token filtering (inference-only heuristic).
+        keep_ratio: fraction of tokens to keep per head (top-k by dt_sp).
+        use_conv_filter: if True, use self.layer_filter_params as a preprocessing smoothing (optional).
+        """
+        hidden_states = self.embedding(input_ids)  # (B, L, d_model)
         residual = None
         self.counter += 1
-        for idx_layer, layer in enumerate(self.layers):
-            # =============== НАЧАЛО ИСПРАВЛЕННОЙ МОДИФИКАЦИИ ===============
-            hidden_states, residual = layer(
-                hidden_states, residual, inference_params=inference_params, **mixer_kwargs
-            )
-            # hidden_states = self.layer_filter_params[idx_layer](hidden_states)
-            if self.counter == 5000:
-                self.batch_covariance(hidden_states)
 
+        for idx_layer, block in enumerate(self.layers):
+            # Optional conv smoothing (you can enable if you'd like)
+            if use_conv_filter:
+                # small conv smoothing to compute smoothed hidden states (doesn't change dims)
+                hidden_states = self.layer_filter_params[idx_layer](hidden_states)
+
+            # compute token mask for this layer if requested
+            token_mask = None
+            if use_token_filter:
+                # block.mixer is instance of Mamba2 (due to create_block)
+                layer_mixer = block.mixer
+                # token_mask = self._compute_token_mask_topk_from_dt(
+                #     layer_mixer, hidden_states, keep_ratio=keep_ratio
+                # )
+                token_mask = self._compute_token_mask_threshold_from_dt(
+                    layer_mixer, hidden_states, g=1e-10
+                )
+                # token_mask shape: (B, L, nheads)
+                # pass token_mask into layer via mixer_kwargs
+                # (Block.forward will forward **mixer_kwargs to mixer)
+                mixer_call_kwargs = dict(inference_params=inference_params, token_mask=token_mask, **mixer_kwargs)
+            else:
+                mixer_call_kwargs = dict(inference_params=inference_params, **mixer_kwargs)
+
+            # call Block.forward (it returns hidden_states, residual)
+            hidden_states, residual = block(hidden_states, residual, **mixer_call_kwargs)
+
+        # optional: save covariance at certain step (as you had)
+        if self.counter == 5000 or self.counter == 2000:
+            self.batch_covariance(hidden_states)
+
+        # final norm / residual merge
         if not self.fused_add_norm:
             residual = (hidden_states + residual) if residual is not None else hidden_states
             hidden_states = self.norm_f(residual.to(dtype=self.norm_f.weight.dtype))
         else:
-            # Set prenorm=False here since we don't need the residual
             hidden_states = layer_norm_fn(
                 hidden_states,
                 self.norm_f.weight,
@@ -248,10 +352,9 @@ class MixerModel(nn.Module):
                 residual=residual,
                 prenorm=False,
                 residual_in_fp32=self.residual_in_fp32,
-                is_rms_norm=isinstance(self.norm_f, RMSNorm)
+                is_rms_norm=isinstance(self.norm_f, RMSNorm),
             )
         return hidden_states
-
 
 class MambaPlusPlusML(nn.Module, GenerationMixin):
 

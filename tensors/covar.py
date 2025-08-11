@@ -6,10 +6,12 @@ def attn_score_plot(path: str, name: str):
     print("[INFO] start of working error_hist_plot for {}".format(name))
     slice_ = False
     t_mark = 100
+    # attn_scores = torch.load("{}/{}.pt".format(path, name)).detach().cpu()
     if "mamba" in name:
         attn_scores = torch.load("{}/{}.pt".format(path, name)).detach().cpu()
     else:
         attn_scores = torch.load("{}/{}.pt".format(path, name))[:,0,:,:].detach().cpu()
+    
     attn_score_heatmap = attn_scores.mean(dim=0)
     attn_score_heatmap[attn_score_heatmap == float('-inf')] = -3
     attn_score_heatmap_min = attn_score_heatmap.min(dim=0, keepdim=True)[0]
@@ -70,8 +72,8 @@ def attn_score_plot(path: str, name: str):
 if __name__ == "__main__":
     path = "/home/adanilishin/mambaProject/tensors"
     # step = 10
-    # step = 2000
-    step = 5000
+    step = 2000
+    # step = 5000
     path = "{}/step_{}".format(path, step)
 
     task = "copy"

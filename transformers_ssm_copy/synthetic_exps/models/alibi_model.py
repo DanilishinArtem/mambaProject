@@ -330,7 +330,7 @@ class GPTNeoXAlibiModel(GPTNeoXPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.config = config
-
+        self.counter = 0
         self.embed_in = nn.Embedding(config.vocab_size, config.hidden_size)
         self.emb_dropout = nn.Dropout(config.hidden_dropout)
         self.layers = nn.ModuleList([GPTNeoXAlibiLayer(config) for _ in range(config.num_hidden_layers)])
@@ -348,6 +348,16 @@ class GPTNeoXAlibiModel(GPTNeoXPreTrainedModel):
     def set_input_embeddings(self, value):
         self.embed_in = value
     
+    def batch_covariance(self, x: torch.Tensor) -> torch.Tensor:
+        x_centered = x - x.mean(dim=-1, keepdim=True)
+        cov = torch.matmul(x_centered, x_centered.transpose(-1, -2))
+        cov = cov / (x.shape[-1] - 1)
+        path = "/home/adanilishin/mambaProject/tensors/alibi_copy.pt"
+        if not os.path.exists(path):
+            torch.save(cov, path)
+            print("[INFO] Tensor saved at: {}".format(path))
+        return cov
+
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -472,6 +482,12 @@ class GPTNeoXAlibiModel(GPTNeoXPreTrainedModel):
                 presents = presents + (outputs[1],)
             if output_attentions:
                 all_attentions = all_attentions + (outputs[2 if use_cache else 1],)
+
+        self.counter += 1
+
+        # if self.counter in (2000, 5000):
+        #     self.batch_covariance(hidden_states)
+
 
         hidden_states = self.final_layer_norm(hidden_states)
         # Add last hidden state
