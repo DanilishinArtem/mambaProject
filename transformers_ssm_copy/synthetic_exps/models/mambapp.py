@@ -116,20 +116,86 @@ def _init_weights(
 
 
 import torch.nn.functional as F
-class CausalLinearCombination(nn.Module):
-    def __init__(self, dim, k):
-        super().__init__()
-        self.k = k
-        self.dim = dim
-        self.conv = nn.Conv1d(dim, dim, kernel_size=k, bias=False)
-    def forward(self, x):
-        x = x.transpose(1, 2)
-        x = F.pad(x, (self.k - 1, 0))
-        y = self.conv(x)
-        return y.transpose(1, 2)
-    
+class HybridPrefixFilter(nn.Module):
+    """
+    Гибридный каузальный фильтр (пер-канальный).
 
-import os
+    - conv_small: короткое ядро, обучаемое — детектирует локальные пики/паттерны
+    - conv_large: длинное ядро, инициализированное как экспоненциальный (Bayesian-like) фильтр
+    - gate: учится балансировать вклад малого и большого фильтров
+
+    Вход/выход: (B, L, D)
+    """
+
+    def __init__(
+        self,
+        dim,
+        k_small=8,
+        k_large=32,
+        q=1e-3,
+        r=0.5,
+        decay=1.0,
+        learnable_steady_init=True,
+        eps=1e-12,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.k_small = k_small
+        self.k_large = k_large
+        self.eps = eps
+
+        # depthwise convs (groups=dim) — каждый канал отдельно
+        self.conv_small = nn.Conv1d(dim, dim, kernel_size=k_small, bias=False, groups=dim)
+        self.conv_large = nn.Conv1d(dim, dim, kernel_size=k_large, bias=False, groups=dim)
+
+        # per-dim gate logit (initial 0 => equal mixing)
+        self.gate_logit = nn.Parameter(torch.zeros(dim))
+
+        # init small conv as Xavier (flexible detector)
+        nn.init.xavier_uniform_(self.conv_small.weight)
+
+        # compute steady-state alpha/beta (to initialize large conv as exponential)
+        q_t = torch.full((dim,), q)
+        r_t = torch.full((dim,), r)
+        disc = (q_t * q_t + 4 * q_t * r_t).clamp_min(eps)
+        P_inf = (-q_t + torch.sqrt(disc)) / 2.0
+        prior_prime = P_inf + q_t
+        K = prior_prime / (prior_prime + r_t)
+        alpha = ((1.0 - K) * float(decay)).clamp(min=0.0, max=0.999999)
+        beta = K
+
+        # build exponential kernels length k_large per-dim
+        l_idx = torch.arange(k_large, dtype=torch.float32)
+        exp_weights = (alpha.unsqueeze(1) ** ((k_large - 1) - l_idx.view(1, -1))) * beta.unsqueeze(1)  # (dim, k_large)
+
+        if learnable_steady_init:
+            # conv.weight shape (out_channels, in_channels/groups, kernel)
+            # for depthwise: (dim, 1, k)
+            with torch.no_grad():
+                self.conv_large.weight.data.copy_(exp_weights.unsqueeze(1))
+        else:
+            nn.init.xavier_uniform_(self.conv_large.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (B, L, D) -> returns (B, L, D)"""
+        B, L, D = x.shape
+        assert D == self.dim
+        x_ = x.transpose(1, 2)  # (B, D, L)
+
+        # pad left for causality
+        xs = F.pad(x_, (self.k_small - 1, 0))
+        ys = self.conv_small(xs)[:, :, :L]  # ensure (B,D,L)
+
+        xl = F.pad(x_, (self.k_large - 1, 0))
+        yl = self.conv_large(xl)[:, :, :L]
+
+        gate = torch.sigmoid(self.gate_logit.view(1, D, 1))
+        y = gate * ys + (1.0 - gate) * yl
+
+        return y.transpose(1, 2)
+
+
+# --- Rewritten MixerModel fragment with HybridPrefixFilter integrated ---
 class MixerModel(nn.Module):
     def __init__(
         self,
@@ -155,9 +221,6 @@ class MixerModel(nn.Module):
         self.embedding = nn.Embedding(vocab_size, d_model, **factory_kwargs)
 
         self.fused_add_norm = fused_add_norm
-        if self.fused_add_norm:
-            if layer_norm_fn is None or rms_norm_fn is None:
-                raise ImportError("Failed to import Triton LayerNorm / RMSNorm kernels")
 
         self.layers = nn.ModuleList(
             [
@@ -191,14 +254,22 @@ class MixerModel(nn.Module):
             )
         )
 
-        # Additional parameters:
-        self.approx_dim = 16
-        # Keep the conv-based filter as optional helper (you can still use it)
-        self.layer_filter_params = nn.ModuleList(
-            [CausalLinearCombination(dim=d_model, k=self.approx_dim) for _ in range(n_layer)]
+        # Replace BayesianPrefixFilter with HybridPrefixFilter (per-layer)
+        # conv filter on hidden states
+        self.layer_filter_params_biasian = nn.ModuleList(
+            [HybridPrefixFilter(d_model, k_small=8, k_large=32) for _ in range(n_layer)]
         )
 
-        self.g_parameter = nn.ParameterList([nn.Parameter(torch.tensor(0.05), requires_grad=True) for _ in range(n_layer)])
+        # per-layer filters for dt (post in_proj) — uses nheads from each block's mixer
+        # create one per layer using the layer's mixer nheads
+        self.layer_dt_filters = nn.ModuleList([
+            HybridPrefixFilter(block.mixer.nheads, k_small=3, k_large=9)
+            for block in self.layers
+        ])
+
+        self.g_parameter = nn.ParameterList([
+            nn.Parameter(torch.tensor(0.05), requires_grad=True) for _ in range(n_layer)
+        ])
 
         self.counter = 0
 
@@ -209,16 +280,8 @@ class MixerModel(nn.Module):
         }
 
     def batch_covariance(self, x: torch.Tensor, by_time: bool = True) -> torch.Tensor:
-        """
-        Вычисляет ковариацию.
-        Если by_time=True → ковариация между временными шагами.
-        Если False → ковариация между признаками.
-        """
         if by_time:
-            # Считаем ковариацию по оси seq_len
-            # x: [batch, seq_len, dim] → [batch, dim, seq_len]
             x = x.transpose(1, 2)
-        # Центрируем
         x_centered = x - x.mean(dim=-1, keepdim=True)
         cov = torch.matmul(x_centered, x_centered.transpose(-1, -2))
         cov = cov / (x.shape[-1] - 1)
@@ -228,66 +291,42 @@ class MixerModel(nn.Module):
             torch.save(cov, path)
             print(f"[INFO] Covariance tensor saved at: {path}")
         return cov
-    
+
     @staticmethod
-    def _compute_token_mask_topk_from_dt(layer_mixer, hidden_states, keep_ratio=0.8):
-        """
-        Для данного слоя (mixer: Mamba2) и скрытых состояний (B,L,D_model)
-        возвращаем mask формы (B,L,nheads) (bool), где для каждой пары (batch,head)
-        сохраняем top-k позиций по dt_sp = softplus(dt + dt_bias).
-        keep_ratio in (0,1] — доля токенов, которые оставляем (напр. 0.2).
-        """
-        # compute projection to extract dt slice
+    def _compute_token_mask_topk_from_dt(layer_mixer, hidden_states, keep_ratio=0.8, dt_filter: nn.Module | None = None):
         with torch.no_grad():
             zxbcdt = layer_mixer.in_proj(hidden_states)  # (B, L, d_in_proj)
-        # split last dim: last piece length == nheads
         nheads = layer_mixer.nheads
-        # indices assuming same split as in Mamba2
-        last = zxbcdt.shape[-1]
-        # get dt slice: it's last nheads entries
-        dt = zxbcdt[..., -nheads:]  # (B,L,nheads)  (pre-softplus)
-        # compute dt_sp
-        # layer_mixer.dt_bias shape (nheads,)
+        dt = zxbcdt[..., -nheads:]
+
+        # optionally filter raw dt BEFORE softplus (can also filter after — experiment)
+        if dt_filter is not None:
+            # dt_filter expects (B,L,D)
+            dt = dt_filter(dt)
+
         dt_sp = F.softplus(dt + layer_mixer.dt_bias.view(1, 1, -1).to(dt.device))
         B, L, H = dt_sp.shape
         assert H == nheads
         k = max(1, int(L * float(keep_ratio)))
-        # permute to (B, H, L) to topk per head
         dt_perm = dt_sp.permute(0, 2, 1)  # (B, H, L)
-        # if k >= L, everything kept
         if k >= L:
             return torch.ones(B, L, H, dtype=torch.bool, device=dt_sp.device)
-        values, indices = torch.topk(dt_perm, k=k, dim=-1)  # (B, H, k)
-        # build mask (B, H, L)
+        values, indices = torch.topk(dt_perm, k=k, dim=-1)
         mask_bhl = torch.zeros(B, H, L, dtype=torch.bool, device=dt_sp.device)
-        # scatter True at indices
         mask_bhl.scatter_(2, indices, True)
-        # transpose back to (B,L,H)
-        mask_blh = mask_bhl.permute(0, 2, 1)
-        return mask_blh
+        return mask_bhl.permute(0, 2, 1)
 
     @staticmethod
-    def _compute_token_mask_threshold_from_dt(layer_mixer, hidden_states, g=0.1):
-        """
-        Для данного слоя (mixer: Mamba2) и скрытых состояний (B,L,D_model)
-        возвращаем mask формы (B,L,nheads) (bool), где для каждой пары (batch,head)
-        сохраняем токены, у которых dt_sp = softplus(dt + dt_bias) >= g.
-
-        Порог g задаётся численно (например, 0.1).
-        """
-        # with torch.no_grad():
+    def _compute_token_mask_threshold_from_dt(layer_mixer, hidden_states, g=0.1, dt_filter: nn.Module | None = None):
         zxbcdt = layer_mixer.in_proj(hidden_states)  # (B, L, d_in_proj)
-
         nheads = layer_mixer.nheads
-        dt = zxbcdt[..., -nheads:]  # (B,L,nheads), pre-softplus
+        dt = zxbcdt[..., -nheads:]
 
-        dt_sp = torch.nn.functional.softplus(dt + layer_mixer.dt_bias.view(1, 1, -1).to(dt.device))  # (B,L,nheads)
-        
-        
-        # mask = torch.sigmoid((dt_sp - torch.sigmoid(g)) * 10)
-        # # Создаём маску: True, где dt_sp >= g
-        mask = dt_sp >= g  # (B,L,nheads), bool tensor
+        if dt_filter is not None:
+            dt = dt_filter(dt)
 
+        dt_sp = torch.nn.functional.softplus(dt + layer_mixer.dt_bias.view(1, 1, -1).to(dt.device))
+        mask = dt_sp >= g
         return mask
 
     def forward(
@@ -296,50 +335,37 @@ class MixerModel(nn.Module):
         inference_params=None,
         use_token_filter: bool = True,
         keep_ratio: float = 0.8,
-        use_conv_filter: bool = False,
+        use_conv_filter: bool = True,
         **mixer_kwargs,
     ):
-        """
-        use_token_filter: if True, apply per-layer per-head token filtering (inference-only heuristic).
-        keep_ratio: fraction of tokens to keep per head (top-k by dt_sp).
-        use_conv_filter: if True, use self.layer_filter_params as a preprocessing smoothing (optional).
-        """
         hidden_states = self.embedding(input_ids)  # (B, L, d_model)
         residual = None
         self.counter += 1
 
         for idx_layer, block in enumerate(self.layers):
-            # Optional conv smoothing (you can enable if you'd like)
+            # Optional conv smoothing applied to hidden states
             if use_conv_filter:
-                # small conv smoothing to compute smoothed hidden states (doesn't change dims)
-                hidden_states = self.layer_filter_params[idx_layer](hidden_states)
+                hidden_states = self.layer_filter_params_biasian[idx_layer](hidden_states)
 
-            # compute token mask for this layer if requested
             token_mask = None
             if use_token_filter:
-                # block.mixer is instance of Mamba2 (due to create_block)
                 layer_mixer = block.mixer
-                # token_mask = self._compute_token_mask_topk_from_dt(
-                #     layer_mixer, hidden_states, keep_ratio=keep_ratio
-                # )
+                # pass per-layer dt_filter (or None if you want no dt filtering)
                 token_mask = self._compute_token_mask_threshold_from_dt(
-                    layer_mixer, hidden_states, g=1e-10
+                    layer_mixer,
+                    hidden_states,
+                    g=1e-10,
+                    dt_filter=(self.layer_dt_filters[idx_layer] if use_conv_filter else None),
                 )
-                # token_mask shape: (B, L, nheads)
-                # pass token_mask into layer via mixer_kwargs
-                # (Block.forward will forward **mixer_kwargs to mixer)
                 mixer_call_kwargs = dict(inference_params=inference_params, token_mask=token_mask, **mixer_kwargs)
             else:
                 mixer_call_kwargs = dict(inference_params=inference_params, **mixer_kwargs)
 
-            # call Block.forward (it returns hidden_states, residual)
             hidden_states, residual = block(hidden_states, residual, **mixer_call_kwargs)
 
-        # optional: save covariance at certain step (as you had)
         if self.counter == 5000 or self.counter == 2000:
             self.batch_covariance(hidden_states)
 
-        # final norm / residual merge
         if not self.fused_add_norm:
             residual = (hidden_states + residual) if residual is not None else hidden_states
             hidden_states = self.norm_f(residual.to(dtype=self.norm_f.weight.dtype))
