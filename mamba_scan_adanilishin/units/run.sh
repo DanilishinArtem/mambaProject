@@ -1,0 +1,1 @@
+pytest -v test_mamba_chunk_scan.py
