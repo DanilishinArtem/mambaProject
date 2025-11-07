@@ -85,8 +85,8 @@ def evaluation(args, model, tokenizer, TO_TOKEN):
         
 
         str_acc_batch = str_acc_batch/len(x)
-        mean_str_acc = np.mean(str_acc_batch)
-        std_str_acc = np.std(str_acc_batch)
+        mean_str_acc = np.mean(str_acc_batch).item()
+        std_str_acc = np.std(str_acc_batch).item()
 
         str_acc_mean_list.append(mean_str_acc)
         str_acc_std_list.append(std_str_acc)

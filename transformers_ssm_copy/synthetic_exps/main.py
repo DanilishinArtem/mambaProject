@@ -72,7 +72,7 @@ def parse_args():
             help="length of the answer to be returned. Set 0 if no constraint on the length of the answer.")
 
     #model
-    parser.add_argument('--model', choices=['T_nope', 'T_rope', 'T_alibi', "T_hard_alibi",  'lstm', 'mamba', 'mambapp'],
+    parser.add_argument('--model', choices=['T_nope', 'T_rope', 'T_alibi', "T_hard_alibi",  'lstm', 'mamba', 'mambapp', 'linformer'],
             required=True, help='''models starting by 'T' are transformers with different positional embeddings. Other choices
             are mamba and lstm.''')
     parser.add_argument('--hidden_size', default=1024, type=int, help="Hidden size of the models")

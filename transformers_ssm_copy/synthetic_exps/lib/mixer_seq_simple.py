@@ -14,9 +14,8 @@ import torch.nn as nn
 from mamba_ssm.models.config_mamba import MambaConfig
 from mamba_ssm.modules.mamba_simple import Mamba
 from mamba_ssm.modules.mamba2 import Mamba2
-from mamba_ssm.modules.mha import MHA
-from mamba_ssm.modules.mlp import GatedMLP
-from mamba_ssm.modules.block import Block
+from lib.mlp import GatedMLP
+from lib.block import Block
 from mamba_ssm.utils.generation import GenerationMixin
 from mamba_ssm.utils.hf import load_config_hf, load_state_dict_hf
 
@@ -25,85 +24,8 @@ try:
 except ImportError:
     RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
 
-def init_(tensor):
-    dim = tensor.shape[-1]
-    std = 1 / math.sqrt(dim)
-    tensor.uniform_(-std, std)
-    return tensor
-
-def default(val, default_val):
-    return val if val is not None else default_val
-
-class LinformerSelfAttention(nn.Module):
-    def __init__(
-        self, dim, seq_len, k=256, heads=8, dim_head=None,
-        one_kv_head=False, share_kv=False, dropout=0.0
-    ):
-        super().__init__()
-        assert dim % heads == 0, 'dimension must be divisible by heads'
-
-        self.seq_len = seq_len
-        self.k = k
-        self.heads = heads
-        self.dim_head = dim_head or (dim // heads)
-        self.share_kv = share_kv
-
-        # Проекции
-        self.to_q = nn.Linear(dim, self.dim_head * heads, bias=False)
-
-        kv_dim = self.dim_head if one_kv_head else (self.dim_head * heads)
-        self.to_k = nn.Linear(dim, kv_dim, bias=False)
-        self.proj_k = nn.Parameter(torch.empty(seq_len, k).uniform_(-0.02, 0.02))
-
-        if not share_kv:
-            self.to_v = nn.Linear(dim, kv_dim, bias=False)
-            self.proj_v = nn.Parameter(torch.empty(seq_len, k).uniform_(-0.02, 0.02))
-
-        self.dropout = nn.Dropout(dropout)
-        self.to_out = nn.Linear(self.dim_head * heads, dim)
-
-        # --- Каузальная маска для проецированной длины ---
-        # seq_len × k → после проекции токен t видит только прошлое и себя
-        proj_mask = torch.ones(seq_len, k, dtype=torch.bool)
-        for i in range(seq_len):
-            allowed_k = min(k, i + 1)  # сколько позиций в проекции можно видеть
-            proj_mask[i, allowed_k:] = False
-        self.register_buffer("causal_proj_mask", proj_mask, persistent=False)
-
-    def forward(self, x, context=None):
-        b, n, _ = x.shape
-        h, d_h, k = self.heads, self.dim_head, self.k
-
-        kv_input = x if context is None else context
-        kv_len = kv_input.shape[1]
-
-        # --- Q, K, V ---
-        q = self.to_q(x).reshape(b, n, h, d_h).transpose(1, 2)  # b,h,n,d_h
-        k_lin = self.to_k(kv_input)
-        v_lin = k_lin if self.share_kv else self.to_v(kv_input)
-
-        proj_k = self.proj_k[:kv_len]  # подрезаем при коротких последовательностях
-        k_proj = torch.einsum('bnd,nk->bkd', k_lin, proj_k)  # b,k,d_kv
-        v_proj = torch.einsum('bnd,nk->bkd', v_lin, proj_k if self.share_kv else self.proj_v[:kv_len])
-
-        # --- Разбиваем на головы ---
-        k_proj = k_proj.reshape(b, k, h, d_h).transpose(1, 2)  # b,h,k,d_h
-        v_proj = v_proj.reshape(b, k, h, d_h).transpose(1, 2)  # b,h,k,d_h
-
-        # --- Attention ---
-        dots = torch.einsum('bhnd,bhkd->bhnk', q, k_proj) * (d_h ** -0.5)
-
-        # Каузальная маска в проекции
-        causal_mask = self.causal_proj_mask[:n, :k]
-        dots = dots.masked_fill(~causal_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
-
-        attn = F.softmax(dots, dim=-1)
-        attn = self.dropout(attn)
-
-        out = torch.einsum('bhnk,bhkd->bhnd', attn, v_proj)
-        out = out.transpose(1, 2).reshape(b, n, -1)
-        return self.to_out(out)
-
+from transformers.models.opt.configuration_opt import OPTConfig
+from lib.opt import OPTLearnedPositionalEmbedding, OPTAttention
 
 def create_block(
     d_model,
@@ -139,7 +61,8 @@ def create_block(
             **factory_kwargs
         )
     else:
-        mixer_cls = partial(MHA, layer_idx=layer_idx, **attn_cfg, **factory_kwargs)
+        config = OPTConfig(attn_cfg)
+        mixer_cls = partial(OPTAttention, layer_idx=layer_idx, config=config, **factory_kwargs)
     norm_cls = partial(
         nn.LayerNorm if not rms_norm else RMSNorm, eps=norm_epsilon, **factory_kwargs
     )
@@ -194,40 +117,37 @@ def _init_weights(
                     p /= math.sqrt(n_residuals_per_layer * n_layer)
 
 
-import torch.nn.functional as F
-class CausalLinearCombinationLocal(nn.Module):
-    def __init__(self, dim, k):
-        super().__init__()
-        self.k = k
-        self.dim = dim
-        self.conv = nn.Conv1d(dim, dim, kernel_size=k, bias=False)
-    def forward(self, x):
-        x = x.transpose(1, 2)
-        x = F.pad(x, (self.k - 1, 0))
-        y = self.conv(x)
-        return y.transpose(1, 2)    
-
-import os
 class MixerModel(nn.Module):
-    def __init__(self, d_model: int, n_layer: int, d_intermediate: int, vocab_size: int,
-                 heads: int = 8,
-                 ssm_cfg=None, attn_layer_idx=None, attn_cfg=None,
-                 norm_epsilon: float = 1e-5, rms_norm: bool = False,
-                 initializer_cfg=None, fused_add_norm=False,
-                 residual_in_fp32=False, device=None, dtype=None) -> None:
+    def __init__(
+        self,
+        d_model: int,
+        n_layer: int,
+        d_intermediate: int,
+        vocab_size: int,
+        ssm_cfg=None,
+        attn_layer_idx=None,
+        attn_cfg=None,
+        norm_epsilon: float = 1e-5,
+        rms_norm: bool = False,
+        initializer_cfg=None,
+        fused_add_norm=False,
+        residual_in_fp32=False,
+        device=None,
+        dtype=None,
+    ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
-
         self.residual_in_fp32 = residual_in_fp32
-        self.fused_add_norm = fused_add_norm
-        self.n_layer = n_layer
-        self.heads = heads
 
         self.embedding = nn.Embedding(vocab_size, d_model, **factory_kwargs)
+        self.embed_positions = OPTLearnedPositionalEmbedding(attn_cfg["max_position_embeddings"], d_model)
+        self.fused_add_norm = fused_add_norm
+        if self.fused_add_norm:
+            if layer_norm_fn is None or rms_norm_fn is None:
+                raise ImportError("Failed to import Triton LayerNorm / RMSNorm kernels")
 
-        # Слои: [n_layer][n_heads]
-        self.layers = nn.ModuleList([
-            nn.ModuleList([
+        self.layers = nn.ModuleList(
+            [
                 create_block(
                     d_model,
                     d_intermediate=d_intermediate,
@@ -238,110 +158,72 @@ class MixerModel(nn.Module):
                     rms_norm=rms_norm,
                     residual_in_fp32=residual_in_fp32,
                     fused_add_norm=fused_add_norm,
+                    layer_idx=i,
                     **factory_kwargs,
-                ) for _ in range(self.heads)
-            ]) for _ in range(self.n_layer)
-        ])
+                )
+                for i in range(n_layer)
+            ]
+        )
 
-        # Кауза́льные фильтры [n_layer][n_heads]
-        self.layer_filter = nn.ModuleList([
-            nn.ModuleList([
-                CausalLinearCombinationLocal(dim=d_model, k=16) for _ in range(self.heads)
-            ]) for _ in range(self.n_layer)
-        ])
-
-        # Веса для агрегации голов внутри каждого слоя
-        self.weights = nn.ParameterList([
-            nn.Parameter(torch.zeros(self.heads)) for _ in range(self.n_layer)
-        ])
-
-        # Финальная нормализация
         self.norm_f = (nn.LayerNorm if not rms_norm else RMSNorm)(
             d_model, eps=norm_epsilon, **factory_kwargs
         )
 
-        # Инициализация весов
         self.apply(
             partial(
                 _init_weights,
                 n_layer=n_layer,
                 **(initializer_cfg if initializer_cfg is not None else {}),
-                n_residuals_per_layer=1 if d_intermediate == 0 else 2,
+                n_residuals_per_layer=1 if d_intermediate == 0 else 2,  # 2 if we have MLP
             )
         )
 
-        self.counter = 0
-
-    def batch_covariance(self, x: torch.Tensor, by_time: bool = True) -> torch.Tensor:
-        """
-        Вычисляет ковариацию.
-        Если by_time=True → ковариация между временными шагами.
-        Если False → ковариация между признаками.
-        """
-        if by_time:
-            # Считаем ковариацию по оси seq_len
-            # x: [batch, seq_len, dim] → [batch, dim, seq_len]
-            x = x.transpose(1, 2)
-        # Центрируем
-        x_centered = x - x.mean(dim=-1, keepdim=True)
-        cov = torch.matmul(x_centered, x_centered.transpose(-1, -2))
-        cov = cov / (x.shape[-1] - 1)
-
-        path = "/home/adanilishin/mambaProject/tensors/mamba_copy.pt"
-        if not os.path.exists(path):
-            torch.save(cov, path)
-            print(f"[INFO] Covariance tensor saved at: {path}")
-        return cov
-
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
         return {
-            i: [head.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
-                for head in layer]
+            i: layer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
             for i, layer in enumerate(self.layers)
         }
 
     def forward(self, input_ids, inference_params=None, **mixer_kwargs):
-        hidden_states = self.embedding(input_ids)  # [batch, seq_len, dim]
+        hidden_states = self.embedding(input_ids)
+        past_seen_tokens = 0
+        cache_position = torch.arange(past_seen_tokens, past_seen_tokens + hidden_states.shape[1], device=hidden_states.device)
+        seq_length = past_seen_tokens + hidden_states.shape[1]
+        attention_mask = torch.ones(hidden_states.shape[0], seq_length, device=hidden_states.device)
+
+        target_length = attention_mask.shape[-1]
+        dtype =  hidden_states.dtype
+        batch_size = hidden_states.shape[0]
+        min_dtype = torch.finfo(dtype).min
+
+        causal_mask = torch.full((seq_length, target_length), fill_value=min_dtype, dtype=dtype, device=cache_position.device)
+        causal_mask = torch.triu(causal_mask, diagonal=1)
+        causal_mask *= torch.arange(target_length, device=cache_position.device) > cache_position.reshape(-1, 1)
+        causal_mask = causal_mask[None, None, :, :].expand(batch_size, 1, -1, -1)
+        causal_mask = causal_mask.clone()
+        mask_length = attention_mask.shape[-1]
+        padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :].to(
+            causal_mask.device
+        )
+        padding_mask = padding_mask == 0
+        causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(padding_mask, min_dtype)
+        position_ids = torch.cumsum(attention_mask, dim=1)
+        position_ids = (position_ids * attention_mask - 1).long()
+        position_ids = position_ids[:, past_seen_tokens:]
+        pos_embeds = self.embed_positions(attention_mask, past_seen_tokens, position_ids=position_ids)
+
+        hidden_states = hidden_states + pos_embeds.to(hidden_states.device)
+
         residual = None
-        self.counter += 1
-
-        for idx_layer in range(self.n_layer):
-            w = torch.softmax(self.weights[idx_layer], dim=0)  # [n_heads]
-            total_heads_hidden_states = torch.zeros_like(hidden_states)
-
-            for idx_head in range(self.heads):
-                head_input = self.layer_filter[idx_layer][idx_head](hidden_states)
-                head_output, _ = self.layers[idx_layer][idx_head](
-                    head_input, None, inference_params=inference_params, **mixer_kwargs
-                )
-                total_heads_hidden_states += head_output * w[idx_head]
-
-            # Residual connection (один раз после агрегации всех голов)
-            residual = (total_heads_hidden_states + hidden_states) if residual is None else (total_heads_hidden_states + residual)
-            hidden_states = residual
-
-        # Считаем ковариацию в определённые моменты
-        if self.counter in (2000, 5000):
-            self.batch_covariance(hidden_states, by_time=True)
-
-        # Финальная нормализация
-        if not self.fused_add_norm:
-            hidden_states = self.norm_f(hidden_states.to(dtype=self.norm_f.weight.dtype))
-        else:
-            hidden_states = layer_norm_fn(
-                hidden_states,
-                self.norm_f.weight,
-                self.norm_f.bias,
-                eps=self.norm_f.eps,
-                residual=None,
-                prenorm=False,
-                residual_in_fp32=self.residual_in_fp32,
-                is_rms_norm=isinstance(self.norm_f, RMSNorm)
+        for layer in self.layers:
+            hidden_states, residual = layer(
+                hidden_states, residual, causal_mask, position_ids, cache_position, inference_params=inference_params, **mixer_kwargs
             )
-
+        hidden_states = self.norm_f(hidden_states)
         return hidden_states
 
-class MambaPlusPlusML(nn.Module, GenerationMixin):
+
+class MambaLMHeadModel(nn.Module, GenerationMixin):
 
     def __init__(
         self,
@@ -381,7 +263,7 @@ class MambaPlusPlusML(nn.Module, GenerationMixin):
             residual_in_fp32=residual_in_fp32,
             **factory_kwargs,
         )
-        self.lm_head = nn.Linear(d_model, vocab_size, bias=False, **factory_kwargs)
+        # self.lm_head = nn.Linear(d_model, vocab_size, bias=False, **factory_kwargs)
 
         # Initialize weights and apply final processing
         self.apply(
@@ -391,7 +273,7 @@ class MambaPlusPlusML(nn.Module, GenerationMixin):
                 **(initializer_cfg if initializer_cfg is not None else {}),
             )
         )
-        self.tie_weights()
+        # self.tie_weights()
 
     def tie_weights(self):
         if self.config.tie_embeddings:
@@ -408,7 +290,8 @@ class MambaPlusPlusML(nn.Module, GenerationMixin):
         hidden_states = self.backbone(input_ids, inference_params=inference_params, **mixer_kwargs)
         if num_last_tokens > 0:
             hidden_states = hidden_states[:, -num_last_tokens:]
-        lm_logits = self.lm_head(hidden_states)
+        lm_logits = hidden_states
+        # lm_logits = self.lm_head(hidden_states)
         CausalLMOutput = namedtuple("CausalLMOutput", ["logits"])
         return CausalLMOutput(logits=lm_logits)
 

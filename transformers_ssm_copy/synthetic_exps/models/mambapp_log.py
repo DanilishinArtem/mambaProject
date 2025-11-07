@@ -114,7 +114,7 @@ def _init_weights(
                 with torch.no_grad():
                     p /= math.sqrt(n_residuals_per_layer * n_layer)
 
-
+import os
 class MixerModel(nn.Module):
     def __init__(
         self,
@@ -180,26 +180,6 @@ class MixerModel(nn.Module):
                 n_residuals_per_layer=1 if d_intermediate == 0 else 2,  # 2 if we have MLP
             )
         )
-        
-        # Additional parameters:
-        self.num_heads = 8
-        self.disp = 10
-        self.layer_exp_coeff = nn.ParameterList([
-            nn.Parameter(torch.ones(self.num_heads), requires_grad=True) for _ in range(n_layer)
-        ])
-        self.layer_exp_bias = nn.ParameterList([
-            nn.Parameter(torch.zeros(self.num_heads), requires_grad=True) for _ in range(n_layer)
-        ])
-        self.layer_coeff = nn.ParameterList([
-            nn.Parameter(torch.ones(self.num_heads), requires_grad=True) for _ in range(n_layer)
-        ])
-
-        self.layer_input_projection = nn.ModuleList([
-            nn.Linear(d_model, d_model * self.num_heads, bias=True) for _ in range(n_layer)
-        ])
-        # End of additional parameters ...
-
-
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
         return {
@@ -211,48 +191,10 @@ class MixerModel(nn.Module):
         hidden_states = self.embedding(input_ids)
         residual = None
         for idx_layer, layer in enumerate(self.layers):
-            # =============== НАЧАЛО ИСПРАВЛЕННОЙ МОДИФИКАЦИИ ===============
-            batch, seq_len, dim = hidden_states.shape
-            projected_states = self.layer_input_projection[idx_layer](hidden_states)
-            
-            # Проверка кратности размерности
-            head_dim = dim
-            # assert self.num_heads * head_dim == dim, f"d_model {dim} must be divisible by num_heads {self.num_heads}"
-            
-            # Реструктуризация в [batch, num_heads, head_dim, seq_len]
-            projected_states = projected_states.view(batch, seq_len, self.num_heads, head_dim)
-            projected_states = projected_states.permute(0, 2, 3, 1)  # [batch, num_heads, head_dim, seq_len]
-            
-            # Получение параметров
-            exp_coeff = self.layer_exp_coeff[idx_layer]  # [num_heads]
-            coeff = self.layer_coeff[idx_layer]          # [num_heads]
-            exp_bias = self.layer_exp_bias[idx_layer]    # [num_heads]
-            
-            # Нормализованные временные метки
-            t = torch.linspace(0, 1, seq_len, device=hidden_states.device)
-            
-            # Вычисление компонентов разложения
-            decay = torch.exp(-exp_coeff.unsqueeze(1) * t.unsqueeze(0))  # [num_heads, seq_len]
-            impulse = (coeff * torch.exp(exp_bias)).unsqueeze(1) * torch.exp(exp_coeff.unsqueeze(1) * t.unsqueeze(0))  # [num_heads, seq_len]
-            
-            # Применение импульса к входным данным
-            weighted_input = projected_states * impulse.unsqueeze(0).unsqueeze(2)  # [batch, num_heads, head_dim, seq_len]
-            
-            # Кумулятивная сумма (интеграл)
-            cumulated = torch.cumsum(weighted_input, dim=-1)  # [batch, num_heads, head_dim, seq_len]
-            
-            # Применение затухания
-            weighted_output = cumulated * decay.unsqueeze(0).unsqueeze(2)  # [batch, num_heads, head_dim, seq_len]
-            
-            # Сборка обратно в [batch, seq_len, dim]
-            weighted_output = weighted_output.permute(0, 3, 1, 2)  # [batch, seq_len, num_heads, head_dim]
-            # hidden_states = weighted_output.reshape(batch, seq_len, dim)
-            hidden_states = weighted_output.sum(dim=2)
-            # =============== КОНЕЦ ИСПРАВЛЕННОЙ МОДИФИКАЦИИ ===============
-            
             hidden_states, residual = layer(
                 hidden_states, residual, inference_params=inference_params, **mixer_kwargs
             )
+
         if not self.fused_add_norm:
             residual = (hidden_states + residual) if residual is not None else hidden_states
             hidden_states = self.norm_f(residual.to(dtype=self.norm_f.weight.dtype))
