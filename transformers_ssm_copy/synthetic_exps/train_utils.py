@@ -22,6 +22,13 @@ def ce_loss(inputs, logits, mask, TO_TOKEN):
 
 def get_optimizer(model,args):
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=0.1)
+    
+    # from torch.optim import SGD
+    # optimizer = SGD(model.parameters(), lr=args.lr)
+
+    # from torch.optim import Adagrad
+    # optimizer = Adagrad(model.parameters(), lr=args.lr)
+
     return optimizer
 
 def custom_get_scheduler(optimizer,num_training_steps):
