@@ -11,7 +11,7 @@
 # python3 synthetic_exps/main.py --model "mambapp" --train_task "copy" --eval_task  "copy" --min_train_len 50 --max_train_len 300 --min_eval_len 950 --max_eval_len 1000 --steps 20 --heads 0 --n_gram 0 --context_len 2001
 
 # python3 synthetic_exps/main.py --model "T_rope" --train_task "copy" --eval_task  "copy" --min_train_len 5 --max_train_len 50 --min_eval_len 15 --max_eval_len 100 --steps 2000 --heads 1 --n_gram 0 --context_len 201
-python3 synthetic_exps/main.py --model "mamba" --train_task "copy" --eval_task  "copy" --min_train_len 5 --max_train_len 50 --min_eval_len 15 --max_eval_len 100 --steps 2000 --heads 0 --n_gram 0 --context_len 201
+python3 synthetic_exps/main.py --model "mamba" --train_task "copy" --eval_task  "copy" --min_train_len 5 --max_train_len 50 --min_eval_len 15 --max_eval_len 100 --steps 20 --heads 0 --n_gram 0 --context_len 201
 
 # T_alibi
 # T_rope

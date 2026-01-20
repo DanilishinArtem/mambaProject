@@ -13,9 +13,11 @@ import torch.nn as nn
 
 from mamba_ssm.models.config_mamba import MambaConfig
 from mamba_ssm.modules.mamba_simple import Mamba
-from mamba_ssm.modules.mamba2 import Mamba2
-from lib.mlp import GatedMLP
-from lib.block import Block
+# from mamba_ssm.modules.mamba2 import Mamba2
+from lib.mamba2 import Mamba2
+from mamba_ssm.modules.mha import MHA
+from mamba_ssm.modules.mlp import GatedMLP
+from mamba_ssm.modules.block import Block
 from mamba_ssm.utils.generation import GenerationMixin
 from mamba_ssm.utils.hf import load_config_hf, load_state_dict_hf
 
@@ -24,8 +26,6 @@ try:
 except ImportError:
     RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
 
-from transformers.models.opt.configuration_opt import OPTConfig
-from lib.opt import OPTLearnedPositionalEmbedding, OPTAttention
 
 def create_block(
     d_model,
@@ -61,8 +61,7 @@ def create_block(
             **factory_kwargs
         )
     else:
-        config = OPTConfig(attn_cfg)
-        mixer_cls = partial(OPTAttention, layer_idx=layer_idx, config=config, **factory_kwargs)
+        mixer_cls = partial(MHA, layer_idx=layer_idx, **attn_cfg, **factory_kwargs)
     norm_cls = partial(
         nn.LayerNorm if not rms_norm else RMSNorm, eps=norm_epsilon, **factory_kwargs
     )
@@ -140,7 +139,12 @@ class MixerModel(nn.Module):
         self.residual_in_fp32 = residual_in_fp32
 
         self.embedding = nn.Embedding(vocab_size, d_model, **factory_kwargs)
-        self.embed_positions = OPTLearnedPositionalEmbedding(attn_cfg["max_position_embeddings"], d_model)
+
+        # We change the order of residual and layer norm:
+        # Instead of LN -> Attn / MLP -> Add, we do:
+        # Add -> LN -> Attn / MLP / Mixer, returning both the residual branch (output of Add) and
+        # the main branch (output of MLP / Mixer). The model definition is unchanged.
+        # This is for performance reason: we can fuse add + layer_norm.
         self.fused_add_norm = fused_add_norm
         if self.fused_add_norm:
             if layer_norm_fn is None or rms_norm_fn is None:
@@ -186,40 +190,26 @@ class MixerModel(nn.Module):
 
     def forward(self, input_ids, inference_params=None, **mixer_kwargs):
         hidden_states = self.embedding(input_ids)
-        past_seen_tokens = 0
-        cache_position = torch.arange(past_seen_tokens, past_seen_tokens + hidden_states.shape[1], device=hidden_states.device)
-        seq_length = past_seen_tokens + hidden_states.shape[1]
-        attention_mask = torch.ones(hidden_states.shape[0], seq_length, device=hidden_states.device)
-
-        target_length = attention_mask.shape[-1]
-        dtype =  hidden_states.dtype
-        batch_size = hidden_states.shape[0]
-        min_dtype = torch.finfo(dtype).min
-
-        causal_mask = torch.full((seq_length, target_length), fill_value=min_dtype, dtype=dtype, device=cache_position.device)
-        causal_mask = torch.triu(causal_mask, diagonal=1)
-        causal_mask *= torch.arange(target_length, device=cache_position.device) > cache_position.reshape(-1, 1)
-        causal_mask = causal_mask[None, None, :, :].expand(batch_size, 1, -1, -1)
-        causal_mask = causal_mask.clone()
-        mask_length = attention_mask.shape[-1]
-        padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :].to(
-            causal_mask.device
-        )
-        padding_mask = padding_mask == 0
-        causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(padding_mask, min_dtype)
-        position_ids = torch.cumsum(attention_mask, dim=1)
-        position_ids = (position_ids * attention_mask - 1).long()
-        position_ids = position_ids[:, past_seen_tokens:]
-        pos_embeds = self.embed_positions(attention_mask, past_seen_tokens, position_ids=position_ids)
-
-        hidden_states = hidden_states + pos_embeds.to(hidden_states.device)
-
         residual = None
         for layer in self.layers:
             hidden_states, residual = layer(
-                hidden_states, residual, causal_mask, position_ids, cache_position, inference_params=inference_params, **mixer_kwargs
+                hidden_states, residual, inference_params=inference_params, **mixer_kwargs
             )
-        hidden_states = self.norm_f(hidden_states)
+        if not self.fused_add_norm:
+            residual = (hidden_states + residual) if residual is not None else hidden_states
+            hidden_states = self.norm_f(residual.to(dtype=self.norm_f.weight.dtype))
+        else:
+            # Set prenorm=False here since we don't need the residual
+            hidden_states = layer_norm_fn(
+                hidden_states,
+                self.norm_f.weight,
+                self.norm_f.bias,
+                eps=self.norm_f.eps,
+                residual=residual,
+                prenorm=False,
+                residual_in_fp32=self.residual_in_fp32,
+                is_rms_norm=isinstance(self.norm_f, RMSNorm)
+            )
         return hidden_states
 
 
@@ -263,7 +253,7 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
             residual_in_fp32=residual_in_fp32,
             **factory_kwargs,
         )
-        # self.lm_head = nn.Linear(d_model, vocab_size, bias=False, **factory_kwargs)
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False, **factory_kwargs)
 
         # Initialize weights and apply final processing
         self.apply(
@@ -273,7 +263,7 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
                 **(initializer_cfg if initializer_cfg is not None else {}),
             )
         )
-        # self.tie_weights()
+        self.tie_weights()
 
     def tie_weights(self):
         if self.config.tie_embeddings:
@@ -290,8 +280,7 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         hidden_states = self.backbone(input_ids, inference_params=inference_params, **mixer_kwargs)
         if num_last_tokens > 0:
             hidden_states = hidden_states[:, -num_last_tokens:]
-        lm_logits = hidden_states
-        # lm_logits = self.lm_head(hidden_states)
+        lm_logits = self.lm_head(hidden_states)
         CausalLMOutput = namedtuple("CausalLMOutput", ["logits"])
         return CausalLMOutput(logits=lm_logits)
 
