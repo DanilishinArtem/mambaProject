@@ -150,7 +150,13 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
             self.out_proj = RowParallelLinear(self.d_inner * self.world_size, self.d_model, bias=bias,
                                               process_group=self.process_group, sequence_parallel=self.sequence_parallel,
                                               **factory_kwargs)
-        # self.mask = torch.tensor([i % 2 for i in range(24)]).cuda()
+        
+        self.N_blocks = 4
+        A = torch.empty(self.nheads, self.N_blocks, dtype=torch.float32, device=device).uniform_(*A_init_range)
+        A_log = torch.log(A).to(dtype=dtype)
+        self.A_log = nn.Parameter(A_log)
+        self.A_log._no_weight_decay = True
+        self.mask = torch.tensor([i % 2 for i in range(self.nheads)]).cuda()
         self.memory_gain = nn.Parameter(torch.zeros(self.nheads)) 
 
     def forward(self, u, seqlen=None, seq_idx=None, cu_seqlens=None, inference_params=None):
@@ -264,9 +270,8 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
 
             # A = self.mask * A
 
-            N_blocks = 4 
             L = x.shape[1]
-            block_len = L // N_blocks
+            block_len = L // self.N_blocks
             current_state = None
             all_y = []
             
@@ -275,15 +280,16 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
             C_reshaped = rearrange(C, "b l (g n) -> b l g n", g=self.ngroups)
             D_reshaped = rearrange(self.D, "(h p) -> h p", p=self.headdim) if self.D_has_hdim else self.D
 
-            for i in range(N_blocks):
+            for i in range(self.N_blocks):
                 start, end = i * block_len, (i + 1) * block_len
-                if(i == N_blocks - 1):
+                LocalA = A[:, i] * self.mask
+                if(i == self.N_blocks - 1):
                     end = L
                 
                 y_block, last_state = mamba_chunk_scan_combined(
                     x_reshaped[:, start:end],
                     dt[:, start:end],
-                    A,
+                    LocalA,
                     B_reshaped[:, start:end],
                     C_reshaped[:, start:end],
                     chunk_size=self.chunk_size,
