@@ -299,7 +299,7 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
     assert B.shape == (batch, seqlen, ngroups, dstate)
     assert x.shape == (batch, seqlen, nheads, headdim)
     assert dt.shape == (batch, seqlen, nheads)
-    assert A.shape == (nheads,)
+    assert A.shape == (seqlen, nheads)
     assert C.shape == B.shape
     if z is not None:
         assert z.shape == x.shape
@@ -356,7 +356,7 @@ def _mamba_chunk_scan_combined_bwd(dout, x, dt, A, B, C, out, chunk_size, D=None
     _, _, ngroups, dstate = B.shape
     assert dout.shape == (batch, seqlen, nheads, headdim)
     assert dt.shape == (batch, seqlen, nheads)
-    assert A.shape == (nheads,)
+    assert A.shape == (seqlen, nheads)
     assert nheads % ngroups == 0
     assert B.shape == (batch, seqlen, ngroups, dstate)
     assert C.shape == B.shape

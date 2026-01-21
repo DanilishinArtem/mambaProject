@@ -28,11 +28,13 @@ from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
 from mamba_ssm.distributed.tensor_parallel import ColumnParallelLinear, RowParallelLinear
 from mamba_ssm.distributed.distributed_utils import all_reduce, reduce_scatter
 
-from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
+# from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
+from mamba_scan_adanilishin import mamba_chunk_scan_combined
+
 from mamba_ssm.ops.triton.ssd_combined import mamba_split_conv1d_scan_combined
 
 from huggingface_hub import PyTorchModelHubMixin
-
+print(f'[INFO] Mamba2 Adanilishin')
 
 class Mamba2(nn.Module, PyTorchModelHubMixin):
     def __init__(
@@ -60,7 +62,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         use_mem_eff_path=False,
         layer_idx=None,  # Absorb kwarg for general module
         process_group=None,
-        sequence_parallel=True,
+        sequence_parallel=False,
         device=None,
         dtype=None,
     ):
@@ -150,14 +152,14 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
             self.out_proj = RowParallelLinear(self.d_inner * self.world_size, self.d_model, bias=bias,
                                               process_group=self.process_group, sequence_parallel=self.sequence_parallel,
                                               **factory_kwargs)
-        
-        # self.N_blocks = 10
-        # A = torch.empty(self.nheads, self.N_blocks, dtype=torch.float32, device=device).uniform_(*A_init_range)
-        # A_log = torch.log(A).to(dtype=dtype)
-        # self.A_log = nn.Parameter(A_log)
+            
+        self.N_blocks = 1
+        A = torch.empty(self.N_blocks, self.nheads, dtype=torch.float32, device=device).uniform_(*A_init_range)
+        A_log = torch.log(A).to(dtype=dtype)
+        self.A_log = nn.Parameter(A_log)
         # self.A_log._no_weight_decay = True
+
         self.mask = torch.tensor([i % 2 for i in range(self.nheads)]).cuda()
-        # self.memory_gain = nn.Parameter(torch.zeros(self.nheads)) 
 
     def forward(self, u, seqlen=None, seq_idx=None, cu_seqlens=None, inference_params=None):
         """
@@ -187,7 +189,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         if seqlen_og is not None:
             zxbcdt = rearrange(zxbcdt, "(b l) d -> b l d", l=seqlen)
         # If the model is loaded in fp16, without the .float() here, A might be -inf
-        A = -torch.exp(self.A_log.float())  # (nheads) or (d_inner, d_state)
+        # A = -torch.exp(self.A_log.float())  # (nheads) or (d_inner, d_state)
         dt_limit_kwargs = {} if self.dt_limit == (0.0, float("inf")) else dict(dt_limit=self.dt_limit)
         if self.use_mem_eff_path and inference_params is None:
             out = mamba_split_conv1d_scan_combined(
@@ -250,7 +252,14 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                 ).transpose(1, 2)
             x, B, C = torch.split(xBC, [self.d_ssm, self.ngroups * self.d_state, self.ngroups * self.d_state], dim=-1)
 
-            A = self.mask * A
+            L = u.shape[1]
+            block_len = L // self.N_blocks
+            block_ids = torch.arange(L, device=u.device) // block_len
+            block_ids = torch.clamp(block_ids, max=self.N_blocks - 1)
+
+            A_base = -torch.exp(self.A_log.float())
+            A = A_base[block_ids] * self.mask
+
             y = mamba_chunk_scan_combined(
                 rearrange(x, "b l (h p) -> b l h p", p=self.headdim),
                 dt,
@@ -259,51 +268,9 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                 rearrange(C, "b l (g n) -> b l g n", g=self.ngroups),
                 chunk_size=self.chunk_size,
                 D=rearrange(self.D, "(h p) -> h p", p=self.headdim) if self.D_has_hdim else self.D,
-                # z=rearrange(z, "b l (h p) -> b l h p", p=self.headdim) if not self.rmsnorm else None,
-                # dt_bias=self.dt_bias,
-                # dt_softplus=True,
-                # seq_idx=seq_idx,
-                # cu_seqlens=cu_seqlens,
-                # **dt_limit_kwargs,
-                # return_final_states=ssm_state is not None,
                 return_final_states=False,
                 return_varlen_states=cu_seqlens is not None and inference_params is not None,
             )
-
-
-            # L = x.shape[1]
-            # block_len = L // self.N_blocks
-            # current_state = None
-            # all_y = []
-            
-            # x_reshaped = rearrange(x, "b l (h p) -> b l h p", p=self.headdim)
-            # B_reshaped = rearrange(B, "b l (g n) -> b l g n", g=self.ngroups)
-            # C_reshaped = rearrange(C, "b l (g n) -> b l g n", g=self.ngroups)
-            # D_reshaped = rearrange(self.D, "(h p) -> h p", p=self.headdim) if self.D_has_hdim else self.D
-
-            # for i in range(self.N_blocks):
-            #     start, end = i * block_len, (i + 1) * block_len
-            #     LocalA = A[:, i] * self.mask
-            #     if(i == self.N_blocks - 1):
-            #         end = L
-                
-            #     y_block, last_state = mamba_chunk_scan_combined(
-            #         x_reshaped[:, start:end],
-            #         dt[:, start:end],
-            #         LocalA,
-            #         B_reshaped[:, start:end],
-            #         C_reshaped[:, start:end],
-            #         chunk_size=self.chunk_size,
-            #         D=D_reshaped,
-            #         initial_states=current_state,
-            #         return_final_states=True, 
-            #         return_varlen_states=cu_seqlens is not None and inference_params is not None,
-            #     )
-            #     current_state = last_state
-            #     all_y.append(y_block)
-
-            # y = torch.cat(all_y, dim=1)
-
 
             if ssm_state is not None:
                 y, last_state, *rest = y
